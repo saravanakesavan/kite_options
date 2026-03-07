@@ -178,8 +178,8 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
     except HTTPException as he:
         raise he
     except Exception as e:
-        logger.error(f"Registration error: {str(e)}")
-        raise HTTPException(status_code=400, detail="Registration failed")
+        logger.error(f"Registration error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
 
 @app.post("/auth/login")
 async def login(user: UserLogin, db: Session = Depends(get_db)):

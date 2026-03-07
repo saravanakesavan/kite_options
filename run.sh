@@ -54,6 +54,49 @@ kill_port() {
 
 source "$VENV_DIR/bin/activate"
 
+# ── DB schema check — reset if stale ─────────────────────────────────────────
+# SQLite DBs created before column additions fail at runtime.
+# Pass --reset-db to wipe and recreate, or we auto-detect obvious mismatches.
+
+DB_FILE="$BACKEND_DIR/trading_app.db"
+
+if [[ "${1:-}" == "--reset-db" ]]; then
+    warn "--reset-db flag passed: removing $DB_FILE"
+    rm -f "$DB_FILE"
+    info "Database will be recreated on startup"
+elif [[ -f "$DB_FILE" ]]; then
+    # Quick schema check: try to read the users table columns
+    SCHEMA_OK=$(python3 - <<'PYCHECK'
+import sys, os
+sys.path.insert(0, os.environ.get("BACKEND_DIR", "."))
+os.chdir(os.environ.get("BACKEND_DIR", "."))
+try:
+    from database import engine
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.execute(text("PRAGMA table_info(users)"))]
+    required = {"id","username","email","hashed_password","is_active","access_token"}
+    missing = required - set(cols)
+    if missing:
+        print("STALE:" + ",".join(missing))
+    else:
+        print("OK")
+except Exception as e:
+    print("ERROR:" + str(e))
+PYCHECK
+    )
+    export BACKEND_DIR
+    if [[ "$SCHEMA_OK" == OK ]]; then
+        info "Database schema OK"
+    else
+        warn "Database schema mismatch ($SCHEMA_OK)"
+        warn "Backing up old DB to trading_app.db.bak and recreating..."
+        cp "$DB_FILE" "${DB_FILE}.bak"
+        rm -f "$DB_FILE"
+        info "Old database backed up — you will need to re-register your account"
+    fi
+fi
+
 # ── Free ports if occupied ────────────────────────────────────────────────────
 
 kill_port 8000
