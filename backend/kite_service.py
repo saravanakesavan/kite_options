@@ -161,6 +161,72 @@ class KiteService:
             logger.error(f"Kite order placement failed: {e}")
             return None
 
+    def modify_order(
+        self,
+        order_id: str,
+        price: Optional[float] = None,
+        quantity: Optional[int] = None,
+        order_type: Optional[str] = None,
+        trigger_price: Optional[float] = None,
+    ) -> bool:
+        """
+        Modify a pending order on Zerodha.
+        Only PENDING orders can be modified; EXECUTED orders cannot.
+        """
+        try:
+            params: Dict = dict(
+                variety=self.kite.VARIETY_REGULAR,
+                order_id=order_id,
+            )
+            if price is not None:
+                params["price"] = price
+            if quantity is not None:
+                params["quantity"] = quantity
+            if order_type is not None:
+                params["order_type"] = (
+                    self.kite.ORDER_TYPE_MARKET if order_type == "MARKET"
+                    else self.kite.ORDER_TYPE_LIMIT
+                )
+            if trigger_price is not None:
+                params["trigger_price"] = trigger_price
+
+            self.kite.modify_order(**params)
+            logger.info(f"Order modified: {order_id} → {params}")
+            return True
+        except Exception as e:
+            logger.error(f"Order modification failed for {order_id}: {e}")
+            return False
+
+    def place_sl_order(
+        self,
+        tradingsymbol: str,
+        quantity: int,
+        trigger_price: float,
+        product: str = "MIS",
+    ) -> Optional[str]:
+        """
+        Place a Stop-Loss Market (SL-M) SELL order.
+        Fires a market sell when price drops to trigger_price.
+        Used to protect a BUY position with a hard stop-loss.
+        """
+        try:
+            kite_product = self.kite.PRODUCT_MIS if product == "MIS" else self.kite.PRODUCT_NRML
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.kite.EXCHANGE_NFO,
+                tradingsymbol=tradingsymbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                quantity=quantity,
+                product=kite_product,
+                order_type=self.kite.ORDER_TYPE_SLM,
+                trigger_price=round(trigger_price, 1),
+            )
+            logger.info(f"SL-M order placed: SELL {quantity} {tradingsymbol} trigger=₹{trigger_price:.1f} → order_id={order_id}")
+            return str(order_id)
+        except Exception as e:
+            logger.error(f"SL order placement failed: {e}")
+            return None
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending order by broker order_id."""
         try:

@@ -85,7 +85,14 @@ class OrderCreate(BaseModel):
     instrument: str
     quantity: int
     price: float
-    order_type: str
+    order_type: str                         # "BUY" or "SELL"
+    stop_loss_percentage: float = 3.0       # default 3% SL on BUY orders
+
+class OrderModify(BaseModel):
+    price: Optional[float] = None
+    quantity: Optional[int] = None
+    order_type: Optional[str] = None       # "MARKET" or "LIMIT"
+    trigger_price: Optional[float] = None
 
 class OrderResponse(BaseModel):
     id: int
@@ -96,6 +103,9 @@ class OrderResponse(BaseModel):
     status: str
     created_at: datetime
     profit_loss: Optional[float] = None
+    broker_order_id: Optional[str] = None
+    sl_trigger_price: Optional[float] = None
+    sl_broker_order_id: Optional[str] = None
 
 class StrategyCreate(BaseModel):
     name: str
@@ -280,6 +290,22 @@ async def place_order(
         if broker_order_id is None:
             raise HTTPException(status_code=502, detail="Kite order placement failed")
 
+        # For BUY orders: attach a Stop-Loss Market (SL-M) SELL order
+        sl_broker_order_id = None
+        sl_trigger_price = None
+        if order.order_type == "BUY":
+            sl_pct = max(0.5, min(order.stop_loss_percentage, 50))  # clamp 0.5–50%
+            sl_trigger_price = round(order.price * (1 - sl_pct / 100), 1)
+            sl_broker_order_id = kite.place_sl_order(
+                tradingsymbol=order.instrument,
+                quantity=order.quantity,
+                trigger_price=sl_trigger_price,
+            )
+            if sl_broker_order_id:
+                logger.info(f"SL order placed: trigger=₹{sl_trigger_price} ({sl_pct}%), broker_sl_id={sl_broker_order_id}")
+            else:
+                logger.warning("SL order placement failed — proceeding without SL")
+
         # Persist to local DB
         new_order = OrderModel(
             user_id=current_user.id,
@@ -290,6 +316,9 @@ async def place_order(
             status='PENDING',
             broker_order_id=broker_order_id,
             entry_price=order.price if order.order_type == 'BUY' else None,
+            sl_percentage=order.stop_loss_percentage if order.order_type == 'BUY' else None,
+            sl_trigger_price=sl_trigger_price,
+            sl_broker_order_id=sl_broker_order_id,
         )
 
         db.add(new_order)
@@ -302,6 +331,8 @@ async def place_order(
             "message": "Order placed successfully",
             "order_id": new_order.id,
             "broker_order_id": broker_order_id,
+            "sl_broker_order_id": sl_broker_order_id,
+            "sl_trigger_price": sl_trigger_price,
             "status": "PENDING",
         }
     except HTTPException as he:
@@ -310,6 +341,180 @@ async def place_order(
         logger.error(f"Order placement error: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=400, detail="Order placement failed")
+
+@app.put("/orders/{order_id}")
+async def modify_order(
+    order_id: int,
+    modify: OrderModify,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Modify a pending order (price, quantity, order_type).
+    Only works while the order is still PENDING on Kite.
+    """
+    db_order = db.query(OrderModel).filter(
+        OrderModel.id == order_id,
+        OrderModel.user_id == current_user.id,
+    ).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if db_order.status != "PENDING":
+        raise HTTPException(status_code=400, detail=f"Cannot modify order in status '{db_order.status}'")
+    if not db_order.broker_order_id:
+        raise HTTPException(status_code=400, detail="Order has no broker order ID")
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite = KiteService(current_user.access_token)
+    success = kite.modify_order(
+        order_id=db_order.broker_order_id,
+        price=modify.price,
+        quantity=modify.quantity,
+        order_type=modify.order_type,
+        trigger_price=modify.trigger_price,
+    )
+    if not success:
+        raise HTTPException(status_code=502, detail="Kite order modification failed")
+
+    # Update local record with changed fields
+    if modify.price is not None:
+        db_order.price = modify.price
+    if modify.quantity is not None:
+        db_order.quantity = modify.quantity
+    db.commit()
+
+    logger.info(f"Order {order_id} modified by user {current_user.username}")
+    return {"message": "Order modified successfully", "order_id": order_id}
+
+
+@app.delete("/orders/{order_id}")
+async def cancel_order(
+    order_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Cancel a pending order on Kite and mark it cancelled locally.
+    Also cancels any attached SL order.
+    """
+    db_order = db.query(OrderModel).filter(
+        OrderModel.id == order_id,
+        OrderModel.user_id == current_user.id,
+    ).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if db_order.status not in ("PENDING",):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel order in status '{db_order.status}'")
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite = KiteService(current_user.access_token)
+
+    # Cancel main order
+    if db_order.broker_order_id:
+        kite.cancel_order(db_order.broker_order_id)
+
+    # Cancel attached SL order if present
+    if db_order.sl_broker_order_id:
+        kite.cancel_order(db_order.sl_broker_order_id)
+
+    db_order.status = "CANCELLED"
+    db.commit()
+
+    logger.info(f"Order {order_id} cancelled by user {current_user.username}")
+    return {"message": "Order cancelled successfully", "order_id": order_id}
+
+
+@app.post("/orders/{order_id}/reverse")
+async def reverse_order_on_profit(
+    order_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Check if a BUY order is currently in profit and, if so, place an immediate
+    SELL (MARKET) order to close the position and lock in the gain.
+    Also cancels the attached SL order if present.
+    """
+    db_order = db.query(OrderModel).filter(
+        OrderModel.id == order_id,
+        OrderModel.user_id == current_user.id,
+        OrderModel.order_type == "BUY",
+        OrderModel.status == "EXECUTED",
+    ).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="No executed BUY order found with that ID")
+    if db_order.exit_price is not None:
+        raise HTTPException(status_code=400, detail="Position already closed")
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite = KiteService(current_user.access_token)
+
+    # Fetch current LTP
+    ltp_map = kite.get_ltp([f"NFO:{db_order.instrument}"])
+    current_price = ltp_map.get(f"NFO:{db_order.instrument}")
+    if not current_price:
+        raise HTTPException(status_code=502, detail="Could not fetch current price from Kite")
+
+    # Check profit
+    investment = db_order.entry_price * db_order.quantity
+    current_pnl = (current_price - db_order.entry_price) * db_order.quantity
+    if current_pnl <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Position is not in profit. Current P&L: ₹{current_pnl:.2f}"
+        )
+
+    # Place SELL order to reverse/close position
+    sell_broker_id = kite.place_order(
+        tradingsymbol=db_order.instrument,
+        transaction_type="SELL",
+        quantity=db_order.quantity,
+        order_type="MARKET",
+    )
+    if sell_broker_id is None:
+        raise HTTPException(status_code=502, detail="Kite SELL order placement failed")
+
+    # Cancel the SL order that's no longer needed
+    if db_order.sl_broker_order_id:
+        kite.cancel_order(db_order.sl_broker_order_id)
+
+    # Record sell order and close buy order
+    sell_record = OrderModel(
+        user_id=current_user.id,
+        instrument=db_order.instrument,
+        quantity=db_order.quantity,
+        price=current_price,
+        order_type="SELL",
+        status="EXECUTED",
+        broker_order_id=sell_broker_id,
+        strategy_id=db_order.strategy_id,
+        exit_price=current_price,
+        profit_loss=current_pnl,
+        executed_at=datetime.now(),
+    )
+    db_order.exit_price = current_price
+    db_order.profit_loss = current_pnl
+
+    db.add(sell_record)
+    db.commit()
+    db.refresh(sell_record)
+
+    logger.info(
+        f"Reverse (profit close) on order {order_id}: SELL {db_order.quantity} "
+        f"{db_order.instrument} @ ₹{current_price:.2f}, P&L=₹{current_pnl:.2f}"
+    )
+    return {
+        "message": "Position closed at profit",
+        "sell_order_id": sell_record.id,
+        "sell_broker_order_id": sell_broker_id,
+        "entry_price": db_order.entry_price,
+        "exit_price": current_price,
+        "profit_loss": round(current_pnl, 2),
+    }
+
 
 @app.get("/strategies", response_model=List[StrategyResponse])
 async def get_strategies(

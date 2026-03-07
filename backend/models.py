@@ -53,7 +53,12 @@ class Order(Base):
     entry_price = Column(Float, nullable=True)
     exit_price = Column(Float, nullable=True)
     profit_loss = Column(Float, default=0.0)
-    
+
+    # Stop-loss tracking
+    sl_percentage = Column(Float, nullable=True)          # e.g. 3.0 for 3%
+    sl_trigger_price = Column(Float, nullable=True)       # computed trigger price
+    sl_broker_order_id = Column(String(100), nullable=True)  # Kite SL order id
+
     # Associated strategy
     strategy_id = Column(Integer, ForeignKey("trading_strategies.id"), nullable=True)
     
