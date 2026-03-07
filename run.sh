@@ -65,27 +65,15 @@ if [[ "${1:-}" == "--reset-db" ]]; then
     rm -f "$DB_FILE"
     info "Database will be recreated on startup"
 elif [[ -f "$DB_FILE" ]]; then
-    # Quick schema check: try to read the users table columns
-    SCHEMA_OK=$(python3 - <<'PYCHECK'
-import sys, os
-sys.path.insert(0, os.environ.get("BACKEND_DIR", "."))
-os.chdir(os.environ.get("BACKEND_DIR", "."))
-try:
-    from database import engine
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        cols = [r[1] for r in conn.execute(text("PRAGMA table_info(users)"))]
-    required = {"id","username","email","hashed_password","is_active","access_token"}
-    missing = required - set(cols)
-    if missing:
-        print("STALE:" + ",".join(missing))
-    else:
-        print("OK")
-except Exception as e:
-    print("ERROR:" + str(e))
-PYCHECK
-    )
-    export BACKEND_DIR
+    # Quick schema check using sqlite3 (built into macOS — no Python env needed)
+    COLS=$(sqlite3 "$DB_FILE" "PRAGMA table_info(users);" 2>/dev/null | awk -F'|' '{print $2}')
+    SCHEMA_OK="OK"
+    for col in id username email hashed_password is_active access_token; do
+        if ! echo "$COLS" | grep -qx "$col"; then
+            SCHEMA_OK="STALE:missing $col"
+            break
+        fi
+    done
     if [[ "$SCHEMA_OK" == OK ]]; then
         info "Database schema OK"
     else
