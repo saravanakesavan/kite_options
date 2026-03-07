@@ -122,6 +122,34 @@ class MarketData(Base):
     macd_signal = Column(Float, nullable=True)
     macd_histogram = Column(Float, nullable=True)
 
+class SignalRecord(Base):
+    """Persisted signal evaluation — used for queue-based prediction."""
+    __tablename__ = "signal_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    instrument = Column(String(100), nullable=False, index=True)
+    evaluated_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    # Raw indicator values at evaluation time
+    rsi = Column(Float, nullable=True)
+    rsi_prev = Column(Float, nullable=True)          # one candle ago
+    macd_histogram = Column(Float, nullable=True)
+    macd_histogram_prev = Column(Float, nullable=True)
+    macd_line = Column(Float, nullable=True)
+    signal_line = Column(Float, nullable=True)
+    current_price = Column(Float, nullable=True)
+    price_trend_pct = Column(Float, nullable=True)   # (close[-1] - close[-6]) / close[-6] * 100
+
+    # Derived signal
+    direction = Column(String(10), nullable=False)   # "BUY", "SELL", "HOLD"
+    confidence = Column(Float, default=0.0)          # 0–100
+    reasons = Column(Text, nullable=True)            # JSON list of reason strings
+
+    # Link to strategy that triggered the scan (optional)
+    strategy_id = Column(Integer, ForeignKey("trading_strategies.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+
 class TradingSession(Base):
     __tablename__ = "trading_sessions"
 

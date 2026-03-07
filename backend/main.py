@@ -27,6 +27,8 @@ except ImportError as e:
     logger.warning(f"Trading engine import failed: {e}. Some features may be limited.")
 
 from kite_service import KiteService
+from signal_engine import SignalEngine
+from models import SignalRecord as SignalRecordModel
 
 # Load environment variables
 load_dotenv()
@@ -514,6 +516,115 @@ async def reverse_order_on_profit(
         "exit_price": current_price,
         "profit_loss": round(current_pnl, 2),
     }
+
+
+@app.get("/suggestions")
+async def get_suggestions(
+    underlying: str = "NIFTY",
+    max_results: int = 5,
+    min_confidence: float = 55.0,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Scan NFO call options for the given underlying and return ranked BUY suggestions.
+    No orders are placed — this is a read-only analysis for human review.
+
+    The engine checks:
+      - RSI oversold + momentum reversal
+      - MACD fresh crossover + histogram momentum
+      - Short-term price trend confirmation
+      - Queue consistency bonus from recent signal history
+
+    Returns suggestions sorted by confidence (highest first).
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
+
+    kite = KiteService(current_user.access_token)
+    engine = SignalEngine(kite=kite, db=db)
+
+    # Fetch instruments for the underlying
+    instruments = kite.get_option_instruments(underlying)
+    if not instruments:
+        return {"suggestions": [], "message": f"No CE instruments found for {underlying}"}
+
+    # Limit scan to nearest 10 strikes by expiry to avoid rate limits
+    instruments = sorted(instruments, key=lambda x: (x.get("expiry", ""), abs(x.get("strike", 0))))[:10]
+
+    suggestions = []
+    for inst in instruments:
+        symbol = inst.get("tradingsymbol")
+        token  = inst.get("instrument_token")
+        if not symbol or not token:
+            continue
+        try:
+            result = engine.evaluate(
+                tradingsymbol=symbol,
+                instrument_token=token,
+                user_id=current_user.id,
+            )
+            if result["direction"] == "BUY" and result["confidence"] >= min_confidence:
+                suggestions.append(result)
+        except Exception as e:
+            logger.warning(f"Signal evaluation failed for {symbol}: {e}")
+
+    suggestions.sort(key=lambda x: x["confidence"], reverse=True)
+
+    return {
+        "suggestions": suggestions[:max_results],
+        "scanned": len(instruments),
+        "total_buy_signals": len(suggestions),
+        "message": (
+            f"Found {len(suggestions)} BUY signal(s) above {min_confidence}% confidence "
+            f"from {len(instruments)} instruments scanned."
+        ),
+    }
+
+
+@app.get("/signals/queue/{instrument}")
+async def get_signal_queue(
+    instrument: str,
+    limit: int = 10,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the last `limit` signal evaluations for an instrument.
+    Use this to inspect the signal history and spot persistent trends.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite = KiteService(current_user.access_token)
+    engine = SignalEngine(kite=kite, db=db)
+    queue = engine.get_signal_queue(instrument=instrument, user_id=current_user.id, limit=limit)
+    return {"instrument": instrument, "queue": queue}
+
+
+@app.get("/signals/prediction/{instrument}")
+async def get_signal_prediction(
+    instrument: str,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Aggregate recent signal queue into a prediction summary.
+
+    Prediction values:
+      STRONG_BUY  — ≥6/10 BUY, streak ≥3, confidence rising/stable
+      BUY         — ≥4/10 BUY
+      HOLD        — ≥8/10 HOLD
+      MIXED       — conflicting signals
+
+    Use this to decide whether to confirm a suggestion as a manual order.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite = KiteService(current_user.access_token)
+    engine = SignalEngine(kite=kite, db=db)
+    return engine.get_prediction(instrument=instrument, user_id=current_user.id)
 
 
 @app.get("/strategies", response_model=List[StrategyResponse])
