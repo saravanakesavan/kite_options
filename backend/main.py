@@ -29,6 +29,7 @@ except ImportError as e:
 from kite_service import KiteService
 from signal_engine import SignalEngine
 from models import SignalRecord as SignalRecordModel
+import position_monitor as pm
 
 # Load environment variables
 load_dotenv()
@@ -673,6 +674,108 @@ async def create_strategy(
         logger.error(f"Strategy creation error: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=400, detail="Strategy creation failed")
+
+@app.post("/monitoring/start")
+async def start_position_monitoring(
+    current_user: UserModel = Depends(get_current_active_user),
+):
+    """
+    Start the 1-minute position monitor for this user.
+    The monitor checks every open BUY position and auto-exits on:
+      - Profit target hit (₹300–₹500)
+      - Extended profit above ₹500 (exit before reversal)
+      - Stop-loss breach (per-order sl_percentage, default 3%)
+      - Force exit at 1:25 PM IST (before Kite auto-squareoff)
+
+    Auto-entry remains manual — only exits are automated.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
+    if pm.is_running(current_user.id):
+        return {"message": "Monitor already running", "user_id": current_user.id}
+
+    started = pm.start_monitor(user_id=current_user.id, access_token=current_user.access_token)
+    if not started:
+        raise HTTPException(status_code=409, detail="Could not start monitor")
+
+    logger.info(f"Position monitor started for user {current_user.username}")
+    return {
+        "message": "Position monitor started — checking every 60 seconds",
+        "user_id": current_user.id,
+        "exit_rules": {
+            "profit_target": "₹300–₹500",
+            "extended_profit": "> ₹500 exits immediately",
+            "stop_loss": "per-order sl_percentage (default 3%)",
+            "force_exit": "1:25 PM IST",
+        },
+    }
+
+
+@app.post("/monitoring/stop")
+async def stop_position_monitoring(
+    current_user: UserModel = Depends(get_current_active_user),
+):
+    """Stop the position monitor for this user."""
+    stopped = pm.stop_monitor(current_user.id)
+    if not stopped:
+        return {"message": "Monitor was not running", "user_id": current_user.id}
+    logger.info(f"Position monitor stop requested for user {current_user.username}")
+    return {"message": "Monitor stop requested — will halt after current cycle", "user_id": current_user.id}
+
+
+@app.get("/monitoring/status")
+async def get_monitoring_status(
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return monitoring status and a live snapshot of all open positions
+    with their current P&L from Kite.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    open_orders = (
+        db.query(OrderModel)
+        .filter(
+            OrderModel.user_id    == current_user.id,
+            OrderModel.order_type == "BUY",
+            OrderModel.status     == "EXECUTED",
+            OrderModel.exit_price.is_(None),
+        )
+        .all()
+    )
+
+    positions = []
+    if open_orders:
+        kite    = KiteService(current_user.access_token)
+        symbols = list({f"NFO:{o.instrument}" for o in open_orders})
+        ltp_map = kite.get_ltp(symbols)
+
+        for o in open_orders:
+            ltp = ltp_map.get(f"NFO:{o.instrument}")
+            pnl = round((ltp - o.entry_price) * o.quantity, 2) if ltp and o.entry_price else None
+            pnl_pct = round((ltp - o.entry_price) / o.entry_price * 100, 2) if ltp and o.entry_price else None
+            positions.append({
+                "order_id"    : o.id,
+                "instrument"  : o.instrument,
+                "quantity"    : o.quantity,
+                "entry_price" : o.entry_price,
+                "current_ltp" : ltp,
+                "pnl"         : pnl,
+                "pnl_pct"     : pnl_pct,
+                "sl_trigger"  : o.sl_trigger_price,
+                "sl_pct"      : o.sl_percentage,
+            })
+
+    return {
+        "monitor_running" : pm.is_running(current_user.id),
+        "open_positions"  : len(positions),
+        "positions"       : positions,
+        "poll_interval_s" : pm.POLL_INTERVAL_SEC,
+        "force_exit_time" : f"{pm.FORCE_EXIT_HOUR:02d}:{pm.FORCE_EXIT_MINUTE:02d} IST",
+    }
+
 
 @app.post("/trading/start")
 async def start_trading(
