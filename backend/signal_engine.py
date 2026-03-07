@@ -56,7 +56,7 @@ class SignalEngine:
     # Historical data helpers
     # ──────────────────────────────────────────────────────
 
-    def _fetch_ohlcv(self, instrument_token: int, days: int = 45) -> Optional[pd.DataFrame]:
+    def _fetch_ohlcv(self, instrument_token: int, days: int = 45) -> Optional[object]:
         """Return a DataFrame with OHLCV columns, or None on failure."""
         if not TA_AVAILABLE:
             return None
@@ -74,7 +74,7 @@ class SignalEngine:
     # Indicator computation
     # ──────────────────────────────────────────────────────
 
-    def _compute_indicators(self, df: pd.DataFrame) -> Dict:
+    def _compute_indicators(self, df: object) -> Dict:
         """
         Returns a dict of indicator values at the latest and previous candle.
         Raises ValueError if insufficient data.

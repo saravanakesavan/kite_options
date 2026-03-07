@@ -25,6 +25,11 @@ from models import (
 )
 from dotenv import load_dotenv
 
+# Load environment variables and configure logging first
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Import trading engine with error handling
 try:
     from trading_engine import TradingEngine
@@ -35,13 +40,6 @@ from kite_service import KiteService
 from signal_engine import SignalEngine
 from models import SignalRecord as SignalRecordModel
 import position_monitor as pm
-
-# Load environment variables
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Options Trading App",
@@ -792,6 +790,7 @@ async def create_strategy(
 @app.post("/monitoring/start")
 async def start_position_monitoring(
     current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
 ):
     """
     Start the 1-minute position monitor for this user.
