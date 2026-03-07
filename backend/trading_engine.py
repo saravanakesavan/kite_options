@@ -1,17 +1,19 @@
 """
-Automated trading engine with RSI and MACD indicators
+Automated trading engine with RSI and MACD indicators backed by Zerodha Kite API.
 """
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+
 import numpy as np
 from sqlalchemy.orm import Session
+
 from database import SessionLocal
+from kite_service import KiteService
 from models import TradingStrategy, Order, MarketData, User
-import json
-import os
 
 # Try to import pandas and ta, handle missing dependencies
 try:
@@ -25,12 +27,25 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Trading hours gate: 9:30 AM – 1:30 PM IST
+TRADE_START = (9, 30)
+TRADE_END = (13, 30)
+
+
+def _within_trading_hours() -> bool:
+    now = datetime.now()
+    start = now.replace(hour=TRADE_START[0], minute=TRADE_START[1], second=0, microsecond=0)
+    end = now.replace(hour=TRADE_END[0], minute=TRADE_END[1], second=0, microsecond=0)
+    return start <= now <= end
+
 class TradingEngine:
-    def __init__(self):
+    def __init__(self, access_token: str):
         self.db = SessionLocal()
-        self.max_investment = 10000.0
-        self.profit_target_min = 300.0
-        self.profit_target_max = 500.0
+        self.kite = KiteService(access_token)
+        self.max_investment = float(os.getenv("MAX_INVESTMENT_PER_TRADE", 10000))
+        self.profit_target_min = float(os.getenv("PROFIT_TARGET_MIN", 300))
+        self.profit_target_max = float(os.getenv("PROFIT_TARGET_MAX", 500))
+        self.stop_loss_pct = float(os.getenv("STOP_LOSS_PERCENTAGE", 20)) / 100
         
     def calculate_rsi(self, prices: List[float], period: int = 14) -> float:
         """Calculate RSI indicator"""
@@ -63,29 +78,25 @@ class TradingEngine:
             logger.warning(f"MACD calculation failed: {e}")
             return {'macd': 0.0, 'signal': 0.0, 'histogram': 0.0}
     
-    def get_historical_prices(self, instrument: str, days: int = 30) -> List[float]:
-        """Get historical prices for technical analysis"""
-        # In a real implementation, this would fetch from Kite API
-        # For now, return sample data
-        
-        # Generate realistic price movement
-        base_price = 150.0
-        prices = []
-        current_price = base_price
-        
-        for i in range(days * 24):  # Hourly data for better resolution
-            # Random walk with some trend
-            change = np.random.normal(0, 0.02) * current_price
-            current_price = max(current_price + change, base_price * 0.5)
-            prices.append(current_price)
-        
-        return prices
+    def get_historical_prices(self, instrument_token: int, days: int = 30) -> List[float]:
+        """Fetch real hourly close prices from Kite for technical analysis."""
+        to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        records = self.kite.get_historical_data(
+            instrument_token=instrument_token,
+            from_date=from_date,
+            to_date=to_date,
+            interval="60minute",
+        )
+        if not records:
+            logger.warning(f"No historical data for token {instrument_token}, using empty list")
+            return []
+        return [r["close"] for r in records]
     
-    def should_buy(self, strategy: TradingStrategy, current_price: float) -> bool:
+    def should_buy(self, strategy: TradingStrategy, current_price: float, instrument_token: int) -> bool:
         """Determine if conditions are met for buying"""
         try:
-            # Get historical data
-            prices = self.get_historical_prices(strategy.instrument)
+            prices = self.get_historical_prices(instrument_token)
             
             # Calculate indicators
             rsi = self.calculate_rsi(prices) if strategy.use_rsi else 50
@@ -124,163 +135,188 @@ class TradingEngine:
         try:
             if order.entry_price is None:
                 return False
-            
-            # Calculate current P&L
+
             quantity = order.quantity
             investment = order.entry_price * quantity
             current_value = current_price * quantity
             current_pnl = current_value - investment
-            
+
             logger.info(f"P&L Analysis: Entry={order.entry_price}, Current={current_price}, P&L=₹{current_pnl:.2f}")
-            
-            # Check profit targets
-            if current_pnl >= self.profit_target_min and current_pnl <= self.profit_target_max:
+
+            if self.profit_target_min <= current_pnl <= self.profit_target_max:
                 logger.info(f"Profit target met: ₹{current_pnl:.2f}")
                 return True
-            
-            # Check stop loss (20% loss)
-            stop_loss_threshold = investment * 0.2
-            if current_pnl <= -stop_loss_threshold:
+
+            if current_pnl <= -(investment * self.stop_loss_pct):
                 logger.warning(f"Stop loss triggered: ₹{current_pnl:.2f}")
                 return True
-            
+
             return False
-            
+
         except Exception as e:
             logger.error(f"Error in sell analysis: {str(e)}")
             return False
     
     def get_current_price(self, instrument: str) -> float:
-        """Get current market price (mock implementation)"""
-        # In real implementation, this would call Kite API
-        # For now, return a random price around base value
-        base_prices = {
-            "NIFTY24DEC24000CE": 150.0,
-            "BANKNIFTY24DEC51000CE": 200.0,
-            "RELIANCE24DEC3000CE": 25.0
-        }
-        
-        base_price = base_prices.get(instrument, 100.0)
-        # Add some random movement
-        variation = np.random.normal(0, 0.05) * base_price
-        return max(base_price + variation, base_price * 0.1)
+        """Get real Last Traded Price from Kite for an NFO instrument."""
+        key = f"NFO:{instrument}"
+        prices = self.kite.get_ltp([key])
+        price = prices.get(key)
+        if price is None:
+            logger.warning(f"LTP unavailable for {instrument}")
+            return 0.0
+        return price
     
     def place_buy_order(self, strategy: TradingStrategy, price: float) -> Optional[Order]:
-        """Place a buy order"""
+        """Place a real BUY order via Kite and record it locally."""
         try:
             quantity = int(self.max_investment / price)
             if quantity == 0:
+                logger.warning(f"Price ₹{price} too high for ₹{self.max_investment} budget")
                 return None
-            
+
+            broker_order_id = self.kite.place_order(
+                tradingsymbol=strategy.instrument,
+                transaction_type="BUY",
+                quantity=quantity,
+                order_type="MARKET",
+            )
+            if broker_order_id is None:
+                return None
+
             order = Order(
                 user_id=strategy.user_id,
                 instrument=strategy.instrument,
                 quantity=quantity,
                 price=price,
-                order_type='BUY',
-                status='EXECUTED',  # Assume immediate execution for demo
+                order_type="BUY",
+                status="EXECUTED",
+                broker_order_id=broker_order_id,
                 strategy_id=strategy.id,
                 entry_price=price,
-                executed_at=datetime.now()
+                executed_at=datetime.now(),
             )
-            
+
             self.db.add(order)
             self.db.commit()
-            
-            logger.info(f"Buy order placed: {quantity} x {strategy.instrument} @ ₹{price}")
+            logger.info(f"Buy order placed: {quantity} x {strategy.instrument} @ ₹{price}, broker_id={broker_order_id}")
             return order
-            
+
         except Exception as e:
-            logger.error(f"Error placing buy order: {str(e)}")
+            logger.error(f"Error placing buy order: {e}")
             self.db.rollback()
             return None
-    
+
     def place_sell_order(self, buy_order: Order, price: float) -> Optional[Order]:
-        """Place a sell order"""
+        """Place a real SELL order via Kite and record P&L locally."""
         try:
+            broker_order_id = self.kite.place_order(
+                tradingsymbol=buy_order.instrument,
+                transaction_type="SELL",
+                quantity=buy_order.quantity,
+                order_type="MARKET",
+            )
+            if broker_order_id is None:
+                return None
+
+            investment = buy_order.entry_price * buy_order.quantity
+            proceeds = price * buy_order.quantity
+            profit_loss = proceeds - investment
+
             sell_order = Order(
                 user_id=buy_order.user_id,
                 instrument=buy_order.instrument,
                 quantity=buy_order.quantity,
                 price=price,
-                order_type='SELL',
-                status='EXECUTED',  # Assume immediate execution for demo
+                order_type="SELL",
+                status="EXECUTED",
+                broker_order_id=broker_order_id,
                 strategy_id=buy_order.strategy_id,
                 exit_price=price,
-                executed_at=datetime.now()
+                profit_loss=profit_loss,
+                executed_at=datetime.now(),
             )
-            
-            # Calculate P&L
-            investment = buy_order.entry_price * buy_order.quantity
-            proceeds = price * buy_order.quantity
-            profit_loss = proceeds - investment
-            sell_order.profit_loss = profit_loss
-            
-            # Update buy order
+
             buy_order.exit_price = price
             buy_order.profit_loss = profit_loss
-            
+
             self.db.add(sell_order)
             self.db.commit()
-            
-            logger.info(f"Sell order placed: {buy_order.quantity} x {buy_order.instrument} @ ₹{price}, P&L: ₹{profit_loss:.2f}")
+            logger.info(f"Sell order placed: {buy_order.quantity} x {buy_order.instrument} @ ₹{price}, P&L: ₹{profit_loss:.2f}, broker_id={broker_order_id}")
             return sell_order
-            
+
         except Exception as e:
-            logger.error(f"Error placing sell order: {str(e)}")
+            logger.error(f"Error placing sell order: {e}")
             self.db.rollback()
             return None
     
+    def _resolve_instrument_token(self, tradingsymbol: str) -> Optional[int]:
+        """Look up the NFO instrument token for a given trading symbol."""
+        try:
+            instruments = self.kite.kite.instruments("NFO")
+            for inst in instruments:
+                if inst["tradingsymbol"] == tradingsymbol:
+                    return inst["instrument_token"]
+            logger.warning(f"Instrument token not found for {tradingsymbol}")
+            return None
+        except Exception as e:
+            logger.error(f"Instrument token lookup failed: {e}")
+            return None
+
     def process_strategy(self, strategy: TradingStrategy):
-        """Process a single trading strategy"""
+        """Process a single trading strategy using real Kite data."""
         try:
             logger.info(f"Processing strategy: {strategy.name} ({strategy.instrument})")
-            
-            # Get current price
+
             current_price = self.get_current_price(strategy.instrument)
+            if current_price == 0.0:
+                logger.warning(f"Skipping {strategy.instrument} — LTP unavailable")
+                return
+
             logger.info(f"Current price for {strategy.instrument}: ₹{current_price}")
-            
-            # Check for open positions
+
             open_orders = self.db.query(Order).filter(
                 Order.strategy_id == strategy.id,
-                Order.order_type == 'BUY',
-                Order.status == 'EXECUTED',
-                Order.exit_price.is_(None)
+                Order.order_type == "BUY",
+                Order.status == "EXECUTED",
+                Order.exit_price.is_(None),
             ).all()
-            
+
             if open_orders:
-                # Check if we should sell any positions
                 for order in open_orders:
                     if self.should_sell(order, current_price):
                         self.place_sell_order(order, current_price)
             else:
-                # Check if we should buy
-                if self.should_buy(strategy, current_price):
+                instrument_token = self._resolve_instrument_token(strategy.instrument)
+                if instrument_token and self.should_buy(strategy, current_price, instrument_token):
                     self.place_buy_order(strategy, current_price)
-                    
+
         except Exception as e:
-            logger.error(f"Error processing strategy {strategy.id}: {str(e)}")
+            logger.error(f"Error processing strategy {strategy.id}: {e}")
     
     def run_trading_cycle(self):
-        """Run one trading cycle for all active automated strategies"""
+        """Run one trading cycle for all active automated strategies."""
+        if not _within_trading_hours():
+            logger.info("Outside trading hours (9:30–13:30). Skipping cycle.")
+            return
+
         try:
             logger.info("Starting trading cycle...")
-            
-            # Get all active automated strategies
+
             strategies = self.db.query(TradingStrategy).filter(
                 TradingStrategy.is_active == True,
-                TradingStrategy.strategy_type == 'AUTOMATED'
+                TradingStrategy.strategy_type == "AUTOMATED",
             ).all()
-            
+
             logger.info(f"Found {len(strategies)} active automated strategies")
-            
+
             for strategy in strategies:
                 self.process_strategy(strategy)
-            
+
             logger.info("Trading cycle completed")
-            
+
         except Exception as e:
-            logger.error(f"Error in trading cycle: {str(e)}")
+            logger.error(f"Error in trading cycle: {e}")
         finally:
             self.db.close()
 

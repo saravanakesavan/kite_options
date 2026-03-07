@@ -26,6 +26,8 @@ try:
 except ImportError as e:
     logger.warning(f"Trading engine import failed: {e}. Some features may be limited.")
 
+from kite_service import KiteService
+
 # Load environment variables
 load_dotenv()
 
@@ -194,17 +196,48 @@ async def get_current_user_info(current_user: UserModel = Depends(get_current_ac
     """Get current user information"""
     return current_user
 
+# Kite OAuth endpoints
+@app.get("/auth/kite/login")
+async def kite_login():
+    """Redirect user to Zerodha Kite login page."""
+    login_url = KiteService.get_login_url()
+    return {"login_url": login_url}
+
+@app.get("/auth/kite/callback")
+async def kite_callback(
+    request_token: str,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Handle Kite OAuth callback.
+    Exchanges request_token for access_token and stores it on the user record.
+    """
+    try:
+        session = KiteService.generate_session(request_token)
+        access_token = session["access_token"]
+
+        current_user.access_token = access_token
+        db.commit()
+
+        logger.info(f"Kite access token saved for user {current_user.username}")
+        return {"message": "Kite account linked successfully", "kite_user_id": session.get("user_id")}
+    except Exception as e:
+        logger.error(f"Kite callback error: {e}")
+        raise HTTPException(status_code=400, detail="Failed to link Kite account")
+
 # Trading endpoints
 @app.get("/instruments")
-async def get_instruments():
-    """Get available trading instruments"""
-    # TODO: Fetch from Kite API
-    sample_instruments = [
-        {"symbol": "NIFTY24DEC24000CE", "name": "NIFTY 24DEC 24000 CE", "current_price": 150.0},
-        {"symbol": "BANKNIFTY24DEC51000CE", "name": "BANKNIFTY 24DEC 51000 CE", "current_price": 200.0},
-        {"symbol": "RELIANCE24DEC3000CE", "name": "RELIANCE 24DEC 3000 CE", "current_price": 25.0}
-    ]
-    return {"instruments": sample_instruments}
+async def get_instruments(
+    underlying: str = "NIFTY",
+    current_user: UserModel = Depends(get_current_active_user),
+):
+    """Get available call option instruments from Kite NFO segment."""
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
+    kite = KiteService(current_user.access_token)
+    instruments = kite.get_option_instruments(underlying)
+    return {"instruments": instruments}
 
 @app.get("/orders", response_model=List[OrderResponse])
 async def get_orders(
@@ -231,7 +264,23 @@ async def place_order(
                 detail=f"Order value ₹{order_value:.2f} exceeds ₹10,000 limit"
             )
         
-        # Create order in database
+        if not current_user.access_token:
+            raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
+
+        # Place order on Zerodha Kite
+        kite = KiteService(current_user.access_token)
+        broker_order_id = kite.place_order(
+            tradingsymbol=order.instrument,
+            transaction_type=order.order_type,
+            quantity=order.quantity,
+            order_type="LIMIT" if order.price else "MARKET",
+            price=order.price if order.price else None,
+        )
+
+        if broker_order_id is None:
+            raise HTTPException(status_code=502, detail="Kite order placement failed")
+
+        # Persist to local DB
         new_order = OrderModel(
             user_id=current_user.id,
             instrument=order.instrument,
@@ -239,19 +288,21 @@ async def place_order(
             price=order.price,
             order_type=order.order_type,
             status='PENDING',
-            entry_price=order.price if order.order_type == 'BUY' else None
+            broker_order_id=broker_order_id,
+            entry_price=order.price if order.order_type == 'BUY' else None,
         )
-        
+
         db.add(new_order)
         db.commit()
         db.refresh(new_order)
-        
-        logger.info(f"Order placed: {order.instrument} - {order.quantity} @ ₹{order.price} by user {current_user.username}")
-        
+
+        logger.info(f"Order placed: {order.instrument} - {order.quantity} @ ₹{order.price} by user {current_user.username}, broker_id={broker_order_id}")
+
         return {
             "message": "Order placed successfully",
             "order_id": new_order.id,
-            "status": "PENDING"
+            "broker_order_id": broker_order_id,
+            "status": "PENDING",
         }
     except HTTPException as he:
         raise he
@@ -326,18 +377,21 @@ async def start_trading(
         raise HTTPException(status_code=400, detail="Failed to start trading")
 
 async def run_user_trading(user_id: int):
-    """Run trading for specific user"""
+    """Run trading for a specific user using their Kite access token."""
+    db = next(get_db())
     try:
-        # Check if TradingEngine is available
-        if 'TradingEngine' not in globals():
-            logger.warning("TradingEngine not available")
+        user = db.query(UserModel).filter(UserModel.id == user_id).first()
+        if not user or not user.access_token:
+            logger.warning(f"User {user_id} has no Kite access token — trading skipped")
             return
-            
-        engine = TradingEngine()
-        # This would run the trading logic for the specific user
-        logger.info(f"Running trading for user {user_id}")
+
+        engine = TradingEngine(access_token=user.access_token)
+        engine.run_trading_cycle()
+        logger.info(f"Trading cycle completed for user {user_id}")
     except Exception as e:
-        logger.error(f"Trading error for user {user_id}: {str(e)}")
+        logger.error(f"Trading error for user {user_id}: {e}")
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
