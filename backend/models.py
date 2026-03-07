@@ -150,6 +150,50 @@ class SignalRecord(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
 
+class MonitoringSession(Base):
+    """
+    Persists per-user monitoring state so it survives server restarts.
+    Source of truth for whether a user's positions should be monitored.
+    """
+    __tablename__ = "monitoring_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    is_active = Column(Boolean, default=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_heartbeat = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")
+
+
+class PositionAlert(Base):
+    """
+    Actionable alert written by the monitor each time a position needs attention.
+    The frontend polls GET /alerts to show these to the user.
+    """
+    __tablename__ = "position_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=True)
+
+    instrument = Column(String(100), nullable=False)
+    alert_type = Column(String(30), nullable=False)
+    # PROFIT_TARGET | EXTENDED_PROFIT | STOP_LOSS | FORCE_EXIT | WATCHING
+
+    current_price = Column(Float, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True)
+    pnl_pct = Column(Float, nullable=True)
+    message = Column(String(500), nullable=False)
+
+    is_actioned = Column(Boolean, default=False)   # True once user clicks exit or dismisses
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    user = relationship("User")
+    order = relationship("Order")
+
+
 class TradingSession(Base):
     __tablename__ = "trading_sessions"
 

@@ -17,7 +17,13 @@ import asyncio
 # Local imports
 from database import get_db, create_tables
 from auth import AuthService, get_current_active_user
-from models import User as UserModel, Order as OrderModel, TradingStrategy as StrategyModel
+from models import (
+    User as UserModel,
+    Order as OrderModel,
+    TradingStrategy as StrategyModel,
+    PositionAlert as AlertModel,
+    MonitoringSession as MonitoringSessionModel,
+)
 from dotenv import load_dotenv
 
 # Import trading engine with error handling
@@ -59,9 +65,14 @@ app.add_middleware(
 async def startup_event():
     create_tables()
     logger.info("Database tables created/verified")
-    
-    # Start automated trading in background
-    # asyncio.create_task(start_trading_engine())
+
+    # Resume monitoring for all users who had active sessions before restart
+    db = next(get_db())
+    try:
+        resumed = pm.resume_all_from_db(db)
+        logger.info(f"Resumed {resumed} monitoring session(s) from DB")
+    finally:
+        db.close()
 
 # Pydantic models for API
 class UserCreate(BaseModel):
@@ -173,30 +184,46 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
         logger.error(f"Registration error: {str(e)}")
         raise HTTPException(status_code=400, detail="Registration failed")
 
-@app.post("/auth/login", response_model=Token)
+@app.post("/auth/login")
 async def login(user: UserLogin, db: Session = Depends(get_db)):
-    """Authenticate user and return access token"""
+    """
+    Authenticate user and return access token.
+    Automatically resumes position monitoring if user had an active session.
+    """
     try:
         authenticated_user = AuthService.authenticate_user(
-            db=db,
-            username=user.username,
-            password=user.password
+            db=db, username=user.username, password=user.password
         )
-        
         if not authenticated_user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password"
+                detail="Incorrect username or password",
             )
-        
+
         access_token = AuthService.create_access_token(
             data={"sub": authenticated_user.username}
         )
-        
-        logger.info(f"User logged in successfully: {user.username}")
+
+        # Auto-resume monitoring if this user had an active session
+        monitor_resumed = False
+        if authenticated_user.access_token and not pm.is_running(authenticated_user.id):
+            session = db.query(MonitoringSessionModel).filter(
+                MonitoringSessionModel.user_id == authenticated_user.id,
+                MonitoringSessionModel.is_active == True,
+            ).first()
+            if session:
+                asyncio.create_task(
+                    pm._monitoring_loop(authenticated_user.id, authenticated_user.access_token)
+                )
+                pm._running_tasks.add(authenticated_user.id)
+                monitor_resumed = True
+                logger.info(f"Monitoring auto-resumed for {authenticated_user.username} on login")
+
+        logger.info(f"User logged in: {user.username}")
         return {
-            "access_token": access_token,
-            "token_type": "bearer"
+            "access_token"    : access_token,
+            "token_type"      : "bearer",
+            "monitor_resumed" : monitor_resumed,
         }
     except HTTPException as he:
         raise he
@@ -519,6 +546,155 @@ async def reverse_order_on_profit(
     }
 
 
+@app.get("/alerts")
+async def get_alerts(
+    unactioned_only: bool = True,
+    limit: int = 50,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return position alerts written by the monitor.
+    Alerts are ordered newest-first.
+    Set unactioned_only=false to see full history including already-exited alerts.
+    """
+    query = db.query(AlertModel).filter(AlertModel.user_id == current_user.id)
+    if unactioned_only:
+        query = query.filter(AlertModel.is_actioned == False)
+    alerts = query.order_by(AlertModel.created_at.desc()).limit(limit).all()
+
+    return {
+        "alerts": [
+            {
+                "id"           : a.id,
+                "order_id"     : a.order_id,
+                "instrument"   : a.instrument,
+                "alert_type"   : a.alert_type,
+                "message"      : a.message,
+                "current_price": a.current_price,
+                "entry_price"  : a.entry_price,
+                "pnl"          : a.pnl,
+                "pnl_pct"      : a.pnl_pct,
+                "is_actioned"  : a.is_actioned,
+                "created_at"   : a.created_at,
+            }
+            for a in alerts
+        ],
+        "count": len(alerts),
+    }
+
+
+@app.post("/alerts/{alert_id}/dismiss")
+async def dismiss_alert(
+    alert_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Dismiss a WATCHING alert without taking action."""
+    alert = db.query(AlertModel).filter(
+        AlertModel.id == alert_id,
+        AlertModel.user_id == current_user.id,
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert.is_actioned = True
+    db.commit()
+    return {"message": "Alert dismissed", "alert_id": alert_id}
+
+
+@app.post("/positions/{order_id}/exit")
+async def single_click_exit(
+    order_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Single-click exit for an open position.
+    Fetches live LTP, places SELL MARKET on Kite, cancels SL order,
+    records P&L, and marks all pending alerts for this order as actioned.
+    Works regardless of whether the position is in profit or loss.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    order = db.query(OrderModel).filter(
+        OrderModel.id        == order_id,
+        OrderModel.user_id   == current_user.id,
+        OrderModel.order_type == "BUY",
+        OrderModel.status    == "EXECUTED",
+    ).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Open BUY position not found")
+    if order.exit_price is not None:
+        raise HTTPException(status_code=400, detail="Position already closed")
+
+    kite = KiteService(current_user.access_token)
+
+    # Live price
+    ltp_map = kite.get_ltp([f"NFO:{order.instrument}"])
+    current_price = ltp_map.get(f"NFO:{order.instrument}")
+    if not current_price:
+        raise HTTPException(status_code=502, detail="Could not fetch LTP from Kite")
+
+    # SELL MARKET
+    sell_broker_id = kite.place_order(
+        tradingsymbol    = order.instrument,
+        transaction_type = "SELL",
+        quantity         = order.quantity,
+        order_type       = "MARKET",
+    )
+    if not sell_broker_id:
+        raise HTTPException(status_code=502, detail="SELL order failed on Kite")
+
+    # Cancel SL order
+    if order.sl_broker_order_id:
+        kite.cancel_order(order.sl_broker_order_id)
+
+    pnl = (current_price - order.entry_price) * order.quantity if order.entry_price else 0
+
+    # Record sell
+    sell_record = OrderModel(
+        user_id         = current_user.id,
+        instrument      = order.instrument,
+        quantity        = order.quantity,
+        price           = current_price,
+        order_type      = "SELL",
+        status          = "EXECUTED",
+        broker_order_id = sell_broker_id,
+        strategy_id     = order.strategy_id,
+        exit_price      = current_price,
+        profit_loss     = pnl,
+        executed_at     = datetime.now(),
+    )
+    order.exit_price  = current_price
+    order.profit_loss = pnl
+    db.add(sell_record)
+
+    # Mark all pending alerts for this order as actioned
+    db.query(AlertModel).filter(
+        AlertModel.order_id   == order_id,
+        AlertModel.is_actioned == False,
+    ).update({"is_actioned": True})
+
+    db.commit()
+    db.refresh(sell_record)
+
+    logger.info(
+        f"Single-click exit: {order.instrument} @ ₹{current_price:.2f} "
+        f"P&L=₹{pnl:+.2f} by {current_user.username}"
+    )
+    return {
+        "message"             : "Position exited",
+        "instrument"          : order.instrument,
+        "sell_order_id"       : sell_record.id,
+        "sell_broker_order_id": sell_broker_id,
+        "entry_price"         : order.entry_price,
+        "exit_price"          : current_price,
+        "quantity"            : order.quantity,
+        "profit_loss"         : round(pnl, 2),
+    }
+
+
 @app.get("/suggestions")
 async def get_suggestions(
     underlying: str = "NIFTY",
@@ -694,7 +870,7 @@ async def start_position_monitoring(
     if pm.is_running(current_user.id):
         return {"message": "Monitor already running", "user_id": current_user.id}
 
-    started = pm.start_monitor(user_id=current_user.id, access_token=current_user.access_token)
+    started = pm.start_monitor(user_id=current_user.id, access_token=current_user.access_token, db=db)
     if not started:
         raise HTTPException(status_code=409, detail="Could not start monitor")
 
@@ -714,13 +890,14 @@ async def start_position_monitoring(
 @app.post("/monitoring/stop")
 async def stop_position_monitoring(
     current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
 ):
     """Stop the position monitor for this user."""
-    stopped = pm.stop_monitor(current_user.id)
+    stopped = pm.stop_monitor(current_user.id, db=db)
     if not stopped:
         return {"message": "Monitor was not running", "user_id": current_user.id}
     logger.info(f"Position monitor stop requested for user {current_user.username}")
-    return {"message": "Monitor stop requested — will halt after current cycle", "user_id": current_user.id}
+    return {"message": "Monitor stop requested — will halt within 1 second", "user_id": current_user.id}
 
 
 @app.get("/monitoring/status")
