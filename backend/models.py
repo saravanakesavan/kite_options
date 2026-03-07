@@ -150,6 +150,15 @@ class SignalRecord(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
 
+class AlertType:
+    """String constants for PositionAlert.alert_type — avoids scattered raw strings."""
+    PROFIT_TARGET   = "PROFIT_TARGET"
+    EXTENDED_PROFIT = "EXTENDED_PROFIT"
+    STOP_LOSS       = "STOP_LOSS"
+    FORCE_EXIT      = "FORCE_EXIT"
+    WATCHING        = "WATCHING"
+
+
 class MonitoringSession(Base):
     """
     Persists per-user monitoring state so it survives server restarts.

@@ -15,14 +15,13 @@ import logging
 import asyncio
 
 # Local imports
-from database import get_db, create_tables
+from database import get_db, create_tables, SessionLocal
 from auth import AuthService, get_current_active_user
 from models import (
     User as UserModel,
     Order as OrderModel,
     TradingStrategy as StrategyModel,
     PositionAlert as AlertModel,
-    MonitoringSession as MonitoringSessionModel,
 )
 from dotenv import load_dotenv
 
@@ -67,7 +66,7 @@ async def startup_event():
     logger.info("Database tables created/verified")
 
     # Resume monitoring for all users who had active sessions before restart
-    db = next(get_db())
+    db = SessionLocal()
     try:
         resumed = pm.resume_all_from_db(db)
         logger.info(f"Resumed {resumed} monitoring session(s) from DB")
@@ -206,17 +205,11 @@ async def login(user: UserLogin, db: Session = Depends(get_db)):
 
         # Auto-resume monitoring if this user had an active session
         monitor_resumed = False
-        if authenticated_user.access_token and not pm.is_running(authenticated_user.id):
-            session = db.query(MonitoringSessionModel).filter(
-                MonitoringSessionModel.user_id == authenticated_user.id,
-                MonitoringSessionModel.is_active == True,
-            ).first()
-            if session:
-                asyncio.create_task(
-                    pm._monitoring_loop(authenticated_user.id, authenticated_user.access_token)
-                )
-                pm._running_tasks.add(authenticated_user.id)
-                monitor_resumed = True
+        if authenticated_user.access_token:
+            monitor_resumed = pm.resume_if_active(
+                authenticated_user.id, authenticated_user.access_token, db
+            )
+            if monitor_resumed:
                 logger.info(f"Monitoring auto-resumed for {authenticated_user.username} on login")
 
         logger.info(f"User logged in: {user.username}")
@@ -483,13 +476,12 @@ async def reverse_order_on_profit(
     kite = KiteService(current_user.access_token)
 
     # Fetch current LTP
-    ltp_map = kite.get_ltp([f"NFO:{db_order.instrument}"])
-    current_price = ltp_map.get(f"NFO:{db_order.instrument}")
+    symbol        = f"NFO:{db_order.instrument}"
+    current_price = kite.get_ltp([symbol]).get(symbol)
     if not current_price:
         raise HTTPException(status_code=502, detail="Could not fetch current price from Kite")
 
     # Check profit
-    investment = db_order.entry_price * db_order.quantity
     current_pnl = (current_price - db_order.entry_price) * db_order.quantity
     if current_pnl <= 0:
         raise HTTPException(
@@ -497,38 +489,12 @@ async def reverse_order_on_profit(
             detail=f"Position is not in profit. Current P&L: ₹{current_pnl:.2f}"
         )
 
-    # Place SELL order to reverse/close position
-    sell_broker_id = kite.place_order(
-        tradingsymbol=db_order.instrument,
-        transaction_type="SELL",
-        quantity=db_order.quantity,
-        order_type="MARKET",
+    sell_broker_id, current_pnl, sell_record = pm.execute_sell_and_record(
+        kite, db, db_order, current_user.id, current_price
     )
-    if sell_broker_id is None:
+    if not sell_broker_id:
         raise HTTPException(status_code=502, detail="Kite SELL order placement failed")
 
-    # Cancel the SL order that's no longer needed
-    if db_order.sl_broker_order_id:
-        kite.cancel_order(db_order.sl_broker_order_id)
-
-    # Record sell order and close buy order
-    sell_record = OrderModel(
-        user_id=current_user.id,
-        instrument=db_order.instrument,
-        quantity=db_order.quantity,
-        price=current_price,
-        order_type="SELL",
-        status="EXECUTED",
-        broker_order_id=sell_broker_id,
-        strategy_id=db_order.strategy_id,
-        exit_price=current_price,
-        profit_loss=current_pnl,
-        executed_at=datetime.now(),
-    )
-    db_order.exit_price = current_price
-    db_order.profit_loss = current_pnl
-
-    db.add(sell_record)
     db.commit()
     db.refresh(sell_record)
 
@@ -560,7 +526,7 @@ async def get_alerts(
     """
     query = db.query(AlertModel).filter(AlertModel.user_id == current_user.id)
     if unactioned_only:
-        query = query.filter(AlertModel.is_actioned == False)
+        query = query.filter(AlertModel.is_actioned.is_(False))
     alerts = query.order_by(AlertModel.created_at.desc()).limit(limit).all()
 
     return {
@@ -631,49 +597,21 @@ async def single_click_exit(
     kite = KiteService(current_user.access_token)
 
     # Live price
-    ltp_map = kite.get_ltp([f"NFO:{order.instrument}"])
-    current_price = ltp_map.get(f"NFO:{order.instrument}")
+    symbol        = f"NFO:{order.instrument}"
+    current_price = kite.get_ltp([symbol]).get(symbol)
     if not current_price:
         raise HTTPException(status_code=502, detail="Could not fetch LTP from Kite")
 
-    # SELL MARKET
-    sell_broker_id = kite.place_order(
-        tradingsymbol    = order.instrument,
-        transaction_type = "SELL",
-        quantity         = order.quantity,
-        order_type       = "MARKET",
+    sell_broker_id, pnl, sell_record = pm.execute_sell_and_record(
+        kite, db, order, current_user.id, current_price
     )
     if not sell_broker_id:
         raise HTTPException(status_code=502, detail="SELL order failed on Kite")
 
-    # Cancel SL order
-    if order.sl_broker_order_id:
-        kite.cancel_order(order.sl_broker_order_id)
-
-    pnl = (current_price - order.entry_price) * order.quantity if order.entry_price else 0
-
-    # Record sell
-    sell_record = OrderModel(
-        user_id         = current_user.id,
-        instrument      = order.instrument,
-        quantity        = order.quantity,
-        price           = current_price,
-        order_type      = "SELL",
-        status          = "EXECUTED",
-        broker_order_id = sell_broker_id,
-        strategy_id     = order.strategy_id,
-        exit_price      = current_price,
-        profit_loss     = pnl,
-        executed_at     = datetime.now(),
-    )
-    order.exit_price  = current_price
-    order.profit_loss = pnl
-    db.add(sell_record)
-
     # Mark all pending alerts for this order as actioned
     db.query(AlertModel).filter(
-        AlertModel.order_id   == order_id,
-        AlertModel.is_actioned == False,
+        AlertModel.order_id    == order_id,
+        AlertModel.is_actioned.is_(False),
     ).update({"is_actioned": True})
 
     db.commit()
