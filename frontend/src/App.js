@@ -1,11 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import Orders from './pages/Orders';
 import Strategies from './pages/Strategies';
+import KiteCallback from './pages/KiteCallback';
+import WinProbability from './pages/WinProbability';
 import Navigation from './components/Navigation';
+import AlertToast from './components/AlertToast';
 import { AuthProvider, useAuth } from './services/AuthContext';
 
 function App() {
@@ -21,7 +24,7 @@ function App() {
 }
 
 function AppContent() {
-  const { user, loading } = useAuth();
+  const { user, loading, alerts, dismissAlert } = useAuth();
 
   if (loading) {
     return (
@@ -35,31 +38,42 @@ function AppContent() {
     <>
       {user && <Navigation />}
       <Routes>
-        <Route 
-          path="/login" 
-          element={!user ? <Login /> : <Navigate to="/dashboard" />} 
+        <Route
+          path="/login"
+          element={!user ? <Login /> : <Navigate to="/dashboard" />}
         />
-        <Route 
-          path="/register" 
-          element={!user ? <Register /> : <Navigate to="/dashboard" />} 
+        <Route
+          path="/register"
+          element={!user ? <Register /> : <Navigate to="/dashboard" />}
         />
-        <Route 
-          path="/dashboard" 
-          element={user ? <Dashboard /> : <Navigate to="/login" />} 
+        <Route
+          path="/dashboard"
+          element={user ? <Dashboard /> : <Navigate to="/login" />}
         />
-        <Route 
-          path="/orders" 
-          element={user ? <Orders /> : <Navigate to="/login" />} 
+        <Route
+          path="/orders"
+          element={user ? <Orders /> : <Navigate to="/login" />}
         />
-        <Route 
-          path="/strategies" 
-          element={user ? <Strategies /> : <Navigate to="/login" />} 
+        <Route
+          path="/strategies"
+          element={user ? <Strategies /> : <Navigate to="/login" />}
         />
-        <Route 
-          path="/" 
-          element={<Navigate to={user ? "/dashboard" : "/login"} />} 
+        <Route
+          path="/win-probability"
+          element={user ? <WinProbability /> : <Navigate to="/login" />}
+        />
+        <Route
+          path="/kite-callback"
+          element={<KiteCallback />}
+        />
+        <Route
+          path="/"
+          element={<Navigate to={user ? "/dashboard" : "/login"} />}
         />
       </Routes>
+
+      {/* Real-time alert toasts — shown on every page */}
+      {user && <AlertToast alerts={alerts} onDismiss={dismissAlert} />}
     </>
   );
 }

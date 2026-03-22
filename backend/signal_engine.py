@@ -16,7 +16,8 @@ from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from kite_service import KiteService
+from kite_service import KiteService, KiteSessionExpiredError
+from llm_analyzer import LLMAnalyzer
 from models import SignalRecord, TradingStrategy
 
 try:
@@ -48,6 +49,9 @@ class SignalEngine:
     persists each evaluation, and provides queue-based prediction.
     """
 
+    # Shared LLM analyzer — one instance per process (holds the API client)
+    _llm = LLMAnalyzer()
+
     def __init__(self, kite: KiteService, db: Session):
         self.kite = kite
         self.db = db
@@ -56,19 +60,130 @@ class SignalEngine:
     # Historical data helpers
     # ──────────────────────────────────────────────────────
 
-    def _fetch_ohlcv(self, instrument_token: int, days: int = 45) -> Optional[object]:
-        """Return a DataFrame with OHLCV columns, or None on failure."""
+    # Minimum candles needed: RSI=14 periods, MACD=26 periods → need ≥27 candles.
+    # We ask for 60 days (420+ hourly candles for the index) but accept ≥27.
+    _MIN_CANDLES = 27
+
+    def _fetch_ohlcv(self, instrument_token: int, days: int = 60) -> Optional[object]:
+        """
+        Return a DataFrame with OHLCV columns, or None if insufficient data.
+        Raises KiteSessionExpiredError if the Kite token is invalid.
+        """
         if not TA_AVAILABLE:
             return None
-        to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        to_date   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-        records = self.kite.get_historical_data(instrument_token, from_date, to_date, "60minute")
-        if not records or len(records) < 30:
-            logger.warning(f"Insufficient historical data for token {instrument_token}")
+        # KiteSessionExpiredError propagates up — do NOT catch it here
+        records   = self.kite.get_historical_data(instrument_token, from_date, to_date, "60minute")
+        if not records or len(records) < self._MIN_CANDLES:
+            logger.warning(
+                f"Insufficient hourly data for token {instrument_token}: "
+                f"got {len(records) if records else 0} candles (need ≥{self._MIN_CANDLES})"
+            )
             return None
         df = pd.DataFrame(records)
         df.rename(columns={"date": "datetime"}, inplace=True)
         return df
+
+    def _fetch_multi_timeframe(self, instrument_token: int) -> Dict:
+        """
+        Fetch daily (90 days) and weekly (26 weeks ≈ 6 months) candles for the
+        given token.  Used to build support/resistance context for the LLM.
+
+        Returns:
+            {
+                "daily":  list[dict] or [],   # last 30 daily rows
+                "weekly": list[dict] or [],   # last 20 weekly rows
+            }
+        """
+        result = {"daily": [], "weekly": []}
+        if not TA_AVAILABLE:
+            return result
+
+        now      = datetime.now()
+        to_date  = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Daily — 90 calendar days covers ~60 trading sessions
+        from_daily = (now - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+        daily_raw  = self.kite.get_historical_data(instrument_token, from_daily, to_date, "day")
+        if daily_raw:
+            result["daily"] = daily_raw[-30:]   # keep last 30 trading days
+
+        # Weekly — 200 calendar days gives ~28 weekly bars
+        from_weekly = (now - timedelta(days=200)).strftime("%Y-%m-%d %H:%M:%S")
+        weekly_raw  = self.kite.get_historical_data(instrument_token, from_weekly, to_date, "week")
+        if weekly_raw:
+            result["weekly"] = weekly_raw[-20:]  # keep last 20 weekly candles
+
+        logger.info(
+            f"Multi-TF fetched for {instrument_token}: "
+            f"daily={len(result['daily'])} weekly={len(result['weekly'])}"
+        )
+        return result
+
+    def _compute_support_resistance(self, daily_rows: List[Dict]) -> Dict:
+        """
+        Derive key price levels from daily OHLCV rows:
+          - Standard pivot points from yesterday's candle (PP, R1/R2, S1/S2)
+          - Swing highs / swing lows (recent 10-day window)
+          - 20-day and 50-day simple moving averages
+
+        Returns a dict ready to pass to the LLM.
+        Returns {} if insufficient data.
+        """
+        if not daily_rows or len(daily_rows) < 5:
+            return {}
+
+        try:
+            closes = [r["close"] for r in daily_rows]
+            highs  = [r["high"]  for r in daily_rows]
+            lows   = [r["low"]   for r in daily_rows]
+
+            # ── Pivot points (from yesterday's daily candle) ──────────────
+            prev      = daily_rows[-2] if len(daily_rows) >= 2 else daily_rows[-1]
+            H, L, C   = prev["high"], prev["low"], prev["close"]
+            PP        = (H + L + C) / 3
+            R1        = 2 * PP - L
+            R2        = PP + (H - L)
+            S1        = 2 * PP - H
+            S2        = PP - (H - L)
+
+            # ── Swing highs / lows (last 10 sessions, look-back=2) ─────────
+            window     = min(10, len(daily_rows))
+            recent_h   = highs[-window:]
+            recent_l   = lows[-window:]
+            swing_highs = []
+            swing_lows  = []
+            for i in range(2, window - 2):
+                if recent_h[i] == max(recent_h[i-2:i+3]):
+                    swing_highs.append(round(recent_h[i], 2))
+                if recent_l[i] == min(recent_l[i-2:i+3]):
+                    swing_lows.append(round(recent_l[i], 2))
+
+            # ── Moving averages ────────────────────────────────────────────
+            ma20 = round(sum(closes[-20:]) / min(20, len(closes)), 2) if len(closes) >= 5 else None
+            ma50 = round(sum(closes[-50:]) / min(50, len(closes)), 2) if len(closes) >= 5 else None
+
+            # ── 52-week high/low from available data ───────────────────────
+            wk52_high = round(max(highs), 2)
+            wk52_low  = round(min(lows), 2)
+
+            return {
+                "pivot_pp": round(PP, 2),
+                "pivot_r1": round(R1, 2),
+                "pivot_r2": round(R2, 2),
+                "pivot_s1": round(S1, 2),
+                "pivot_s2": round(S2, 2),
+                "swing_highs": sorted(set(swing_highs), reverse=True)[:3],
+                "swing_lows":  sorted(set(swing_lows))[:3],
+                "ma_20": ma20,
+                "ma_50": ma50,
+                "period_high": wk52_high,
+                "period_low":  wk52_low,
+            }
+        except Exception as e:
+            logger.warning(f"S/R computation failed: {e}")
+            return {}
 
     # ──────────────────────────────────────────────────────
     # Indicator computation
@@ -231,22 +346,62 @@ class SignalEngine:
         user_id: int,
         rsi_oversold: int = 30,
         strategy_id: Optional[int] = None,
+        underlying_token: Optional[int] = None,
     ) -> Dict:
         """
         Full evaluation for one instrument.
         Persists the signal to DB.
         Returns a suggestion dict ready to send to the frontend.
+
+        If the option itself has < 30 candles (new/near-expiry contract),
+        falls back to the underlying index's OHLCV data (underlying_token).
+        This is actually better technically — index TA is more reliable
+        than option-price TA for entry signals.
         """
-        df = self._fetch_ohlcv(instrument_token)
+        # ── Fetch OHLCV with fallback chain and explicit error surfacing ─────
+        session_error_msg = None
+        data_source = "option"
+        try:
+            df = self._fetch_ohlcv(instrument_token)
+        except KiteSessionExpiredError as exc:
+            session_error_msg = str(exc)
+            df = None
+
+        if df is None and underlying_token and underlying_token != instrument_token:
+            data_source = "underlying index"
+            logger.info(
+                f"{tradingsymbol}: option data insufficient ({session_error_msg or 'too few candles'}), "
+                f"falling back to underlying token {underlying_token}"
+            )
+            try:
+                df = self._fetch_ohlcv(underlying_token)
+                if df is not None:
+                    session_error_msg = None  # underlying worked — no auth problem
+            except KiteSessionExpiredError as exc:
+                session_error_msg = str(exc)
+                df = None
+
         if df is None:
+            if session_error_msg:
+                reason = "Kite session expired — please reconnect Kite (Dashboard → Connect Kite)"
+            elif underlying_token:
+                reason = (
+                    f"No hourly data for this option or its underlying index. "
+                    f"If market is closed, data will be available on the next trading day. "
+                    f"Select ATM/near-ATM strikes for best results."
+                )
+            else:
+                reason = "Insufficient historical data — select ATM or near-ATM strikes"
             return {
                 "instrument": tradingsymbol,
                 "direction": "HOLD",
                 "confidence": 0,
-                "reasons": ["Insufficient historical data"],
+                "reasons": [reason],
                 "current_price": None,
                 "suggested_entry": None,
                 "suggested_sl": None,
+                "data_source": data_source,
+                "session_expired": bool(session_error_msg),
             }
 
         try:
@@ -265,8 +420,42 @@ class SignalEngine:
 
         base_score, reasons = self._score_buy(ind, rsi_oversold)
 
-        # Determine raw direction from base score
-        if base_score >= MIN_BUY_CONFIDENCE:
+        # ── Multi-timeframe + Support/Resistance ──────────────────
+        # Use the underlying index token for daily/weekly data — index candles
+        # are more meaningful for S/R than individual option prices.
+        mtf_token  = underlying_token if underlying_token else instrument_token
+        mtf_data   = self._fetch_multi_timeframe(mtf_token)
+        sr_levels  = self._compute_support_resistance(mtf_data["daily"])
+
+        # ── LLM analysis ──────────────────────────────────────────
+        ohlcv_rows = df.to_dict(orient="records") if df is not None else []
+        llm_result = self._llm.analyze(
+            tradingsymbol=tradingsymbol,
+            ohlcv_rows=ohlcv_rows,
+            indicators=ind,
+            spot_price=ind.get("current_price", 0),
+            daily_rows=mtf_data["daily"],
+            weekly_rows=mtf_data["weekly"],
+            support_resistance=sr_levels,
+        )
+        llm_direction  = llm_result["direction"]
+        llm_confidence = llm_result["confidence"]
+        llm_reasons    = llm_result["reasoning"]
+
+        # Blend: 40% rule-based + 60% LLM (LLM has broader context)
+        # If LLM is unavailable, fall back to 100% rule-based.
+        if llm_result["available"] and llm_confidence > 0:
+            blended_score = round(0.40 * base_score + 0.60 * llm_confidence, 1)
+            reasons.append(
+                f"LLM ({llm_direction} {llm_confidence}%): "
+                + " | ".join(llm_reasons[:2])  # top 2 LLM reasons inline
+            )
+        else:
+            blended_score = base_score
+            reasons.append("LLM: unavailable — using rule-based score only")
+
+        # Determine raw direction from blended score
+        if blended_score >= MIN_BUY_CONFIDENCE:
             direction = "BUY"
         else:
             direction = "HOLD"
@@ -274,7 +463,7 @@ class SignalEngine:
         # Queue boost/penalty
         boost, queue_reason = self._queue_confidence_boost(tradingsymbol, user_id, direction)
         reasons.append(f"Queue: {queue_reason}")
-        final_score = max(0.0, min(100.0, base_score + boost))
+        final_score = max(0.0, min(100.0, blended_score + boost))
 
         # Re-evaluate direction after queue adjustment
         if final_score >= MIN_BUY_CONFIDENCE:
@@ -329,6 +518,17 @@ class SignalEngine:
             "current_price": round(price, 2),
             "suggested_entry": round(price, 2),
             "suggested_sl": suggested_sl,
+            "llm_analysis": {
+                "direction":   llm_result["direction"],
+                "confidence":  llm_result["confidence"],
+                "reasoning":   llm_result["reasoning"],
+                "available":   llm_result["available"],
+            },
+            "rule_score": round(base_score, 1),
+            "blended_score": blended_score,
+            "support_resistance": sr_levels,
+            "weekly_candles_used": len(mtf_data["weekly"]),
+            "daily_candles_used":  len(mtf_data["daily"]),
         }
 
     # ──────────────────────────────────────────────────────

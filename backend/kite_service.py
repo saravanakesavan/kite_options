@@ -44,16 +44,41 @@ class KiteService:
     # Market data
     # ------------------------------------------------------------------
 
+    def validate_session(self) -> None:
+        """
+        Perform a cheap API call to verify the access token is still valid.
+        Raises KiteSessionExpiredError if the token has expired or is invalid.
+        Call this at the start of any heavy endpoint before doing 15+ API calls.
+        """
+        try:
+            # profile() is the lightest authenticated endpoint Kite offers
+            self.kite.profile()
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("permission", "token", "invalid", "auth",
+                                             "403", "401", "session", "expired")):
+                raise KiteSessionExpiredError(
+                    f"Kite session expired — please re-link your Kite account. (raw: {e})"
+                ) from e
+            raise  # re-raise unexpected errors as-is
+
     def get_ltp(self, instruments: List[str]) -> Dict[str, float]:
         """
         Get Last Traded Price for a list of instruments.
         instruments format: ["NFO:NIFTY24DEC24000CE", ...]
         Returns: {"NFO:NIFTY24DEC24000CE": 152.5, ...}
+        Raises KiteSessionExpiredError on auth/permission failure.
         """
         try:
             quote = self.kite.ltp(instruments)
             return {symbol: data["last_price"] for symbol, data in quote.items()}
         except Exception as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("permission", "token", "invalid", "auth",
+                                             "403", "401", "session", "expired")):
+                raise KiteSessionExpiredError(
+                    f"Kite session expired — please re-link your Kite account. (raw: {e})"
+                ) from e
             logger.error(f"LTP fetch failed: {e}")
             return {}
 
@@ -68,6 +93,7 @@ class KiteService:
         Fetch OHLCV historical data.
         interval options: minute, 3minute, 5minute, 15minute, 30minute, 60minute, day
         Returns list of dicts with keys: date, open, high, low, close, volume
+        Raises KiteHistoricalError on auth failure so callers can surface the real reason.
         """
         try:
             records = self.kite.historical_data(
@@ -76,9 +102,15 @@ class KiteService:
                 to_date=to_date,
                 interval=interval,
             )
-            return records
+            return records or []
         except Exception as e:
-            logger.error(f"Historical data fetch failed: {e}")
+            err_str = str(e).lower()
+            # Surface auth / session failures explicitly so callers can tell the user
+            if any(kw in err_str for kw in ("token", "invalid", "auth", "403", "401", "session")):
+                raise KiteSessionExpiredError(
+                    f"Kite session expired or invalid token — please reconnect Kite. (raw: {e})"
+                ) from e
+            logger.error(f"Historical data fetch failed for token {instrument_token} [{interval}]: {e}")
             return []
 
     def get_option_instruments(self, underlying: str = "NIFTY") -> List[Dict]:
@@ -95,6 +127,7 @@ class KiteService:
         except Exception as e:
             logger.error(f"Instruments fetch failed: {e}")
             return []
+
 
     # ------------------------------------------------------------------
     # Order management
@@ -267,3 +300,100 @@ class KiteService:
         except Exception as e:
             logger.error(f"Margins fetch failed: {e}")
             return {}
+
+    def get_all_kite_orders(self) -> List[Dict]:
+        """
+        Fetch all orders placed today from Kite.
+        Used to rebuild the local DB after a wipe.
+
+        Returns a list of Kite order dicts with at minimum:
+          order_id, tradingsymbol, transaction_type, quantity,
+          average_price / price, status, order_timestamp
+        """
+        try:
+            orders = self.kite.orders()
+            return orders or []
+        except Exception as e:
+            logger.error(f"Kite orders fetch failed: {e}")
+            return []
+
+    def get_market_depth(self, tradingsymbol: str) -> Dict:
+        """
+        Fetch 5-level bid/ask market depth for a single NFO instrument.
+
+        Returns a dict with:
+          buy  : list of 5 dicts {price, quantity, orders}  — best bid first
+          sell : list of 5 dicts {price, quantity, orders}  — best ask first
+          total_buy_qty  : sum of all 5 bid quantities
+          total_sell_qty : sum of all 5 ask quantities
+          imbalance      : buy_qty / (buy_qty + sell_qty),  range 0.0–1.0
+                           > 0.6 = buyer dominated
+                           < 0.4 = seller dominated
+          spread         : best_ask_price - best_bid_price
+          spread_pct     : spread / mid_price * 100
+
+        Returns empty dict on failure (e.g. market closed, API error).
+        """
+        key = f"NFO:{tradingsymbol}"
+        try:
+            full_quote = self.kite.quote([key])
+            q = full_quote.get(key, {})
+            depth = q.get("depth", {})
+            buys  = depth.get("buy",  [])
+            sells = depth.get("sell", [])
+
+            total_buy  = sum(d.get("quantity", 0) for d in buys)
+            total_sell = sum(d.get("quantity", 0) for d in sells)
+            total      = total_buy + total_sell
+
+            imbalance = (total_buy / total) if total > 0 else 0.5
+
+            best_bid = buys[0].get("price",  0) if buys  else 0
+            best_ask = sells[0].get("price", 0) if sells else 0
+            spread = best_ask - best_bid if (best_bid and best_ask) else 0
+            mid    = (best_bid + best_ask) / 2 if (best_bid and best_ask) else 0
+            spread_pct = (spread / mid * 100) if mid > 0 else 0
+
+            return {
+                "buy":            buys,
+                "sell":           sells,
+                "total_buy_qty":  total_buy,
+                "total_sell_qty": total_sell,
+                "imbalance":      round(imbalance, 4),
+                "best_bid":       best_bid,
+                "best_ask":       best_ask,
+                "spread":         round(spread, 2),
+                "spread_pct":     round(spread_pct, 3),
+            }
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("permission", "token", "invalid", "auth",
+                                             "403", "401", "session", "expired")):
+                raise KiteSessionExpiredError(
+                    f"Kite session expired — please re-link your Kite account. (raw: {e})"
+                ) from e
+            logger.warning(f"Market depth fetch failed for {tradingsymbol}: {e}")
+            return {}
+
+    def get_available_cash(self) -> float:
+        """
+        Convenience helper — returns net available cash as a single float.
+        Returns 0.0 on any error so callers don't need try/except.
+        """
+        try:
+            margins = self.kite.margins()
+            eq = margins.get("equity", {})
+            return float(
+                eq.get("net", 0)
+                or eq.get("available", {}).get("live_balance", 0)
+                or eq.get("available", {}).get("cash", 0)
+                or 0
+            )
+        except Exception as e:
+            logger.error(f"Available cash fetch failed: {e}")
+            return 0.0
+
+
+class KiteSessionExpiredError(Exception):
+    """Raised when Kite returns an auth/token error during historical data fetch."""
+    pass

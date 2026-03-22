@@ -137,8 +137,8 @@ const Strategies = () => {
                   >
                     <option value="">Select Instrument</option>
                     {instruments.map((inst, index) => (
-                      <option key={index} value={inst.symbol}>
-                        {inst.name} - ₹{inst.current_price}
+                      <option key={index} value={inst.tradingsymbol}>
+                        {inst.tradingsymbol} — ₹{inst.last_price ? inst.last_price.toFixed(2) : '0.00'} | Strike ₹{inst.strike?.toLocaleString('en-IN')}
                       </option>
                     ))}
                   </select>

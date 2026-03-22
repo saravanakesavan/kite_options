@@ -33,14 +33,44 @@ api.interceptors.response.use(
 
 // Auth API
 export const authAPI = {
-  login: (username, password) => 
+  login: (username, password) =>
     api.post('/auth/login', { username, password }),
-  
-  register: (username, email, password) => 
+
+  register: (username, email, password) =>
     api.post('/auth/register', { username, email, password }),
-  
-  getCurrentUser: () => 
+
+  getCurrentUser: () =>
     api.get('/auth/me'),
+};
+
+// Kite OAuth API
+export const kiteAPI = {
+  getLoginUrl: () =>
+    api.get('/auth/kite/login'),
+
+  exchangeToken: (request_token) =>
+    api.post('/auth/kite/token', { request_token }),
+};
+
+// Analysis API
+export const analysisAPI = {
+  getMargins: () =>
+    api.get('/margins'),
+
+  analyzeInstrument: (tradingsymbol, instrument_token) =>
+    api.get(`/signal/analyze/${tradingsymbol}`, { params: { instrument_token } }),
+
+  getDashboardSummary: () =>
+    api.get('/dashboard/summary'),
+
+  syncOrdersFromKite: () =>
+    api.post('/sync/orders'),
+};
+
+// Win Probability Ranking API
+export const rankAPI = {
+  getRanking: (underlying = 'NIFTY', maxResults = 10) =>
+    api.get('/rank', { params: { underlying, max_results: maxResults } }),
 };
 
 // Trading API

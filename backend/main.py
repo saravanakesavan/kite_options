@@ -3,7 +3,7 @@ Options Trading App Backend
 FastAPI application for automated options trading with Zerodha Kite API
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -16,7 +16,7 @@ import asyncio
 
 # Local imports
 from database import get_db, create_tables, SessionLocal
-from auth import AuthService, get_current_active_user
+from auth import AuthService, get_current_active_user, ensure_admin_in_db
 from models import (
     User as UserModel,
     Order as OrderModel,
@@ -38,8 +38,12 @@ except ImportError as e:
 
 from kite_service import KiteService
 from signal_engine import SignalEngine
+from win_probability_engine import WinProbabilityEngine
 from models import SignalRecord as SignalRecordModel
 import position_monitor as pm
+from alert_hub import hub
+from jose import jwt, JWTError
+from auth import SECRET_KEY, ALGORITHM
 
 app = FastAPI(
     title="Options Trading App",
@@ -63,9 +67,12 @@ async def startup_event():
     create_tables()
     logger.info("Database tables created/verified")
 
-    # Resume monitoring for all users who had active sessions before restart
     db = SessionLocal()
     try:
+        # Guarantee admin user always exists (survives DB wipe)
+        ensure_admin_in_db(db)
+
+        # Resume monitoring for all users who had active sessions before restart
         resumed = pm.resume_all_from_db(db)
         logger.info(f"Resumed {resumed} monitoring session(s) from DB")
     finally:
@@ -158,6 +165,56 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now()}
 
+
+# ── WebSocket — real-time alert stream ────────────────────────────────────────
+
+@app.websocket("/ws")
+async def websocket_alerts(
+    ws: WebSocket,
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    WebSocket endpoint that streams real-time position alerts to the frontend.
+
+    Connect with:  ws://localhost:8000/ws?token=<JWT>
+
+    Messages pushed by server:
+      { "type": "ALERT",    "alert_type": "...", "instrument": "...",
+        "pnl": 0.0, "pnl_pct": 0.0, "message": "...", "actioned": true }
+      { "type": "WATCHING", "instrument": "...", "pnl": 0.0, "pnl_pct": 0.0,
+        "current_price": 0.0, "entry_price": 0.0, "message": "..." }
+      { "type": "PING" }   — heartbeat every 30 s to keep connection alive
+    """
+    # Authenticate via JWT passed as query param (WebSocket cannot send headers).
+    # sub contains the username; look up user_id from DB.
+    try:
+        payload  = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise ValueError("no sub")
+        user_obj = db.query(UserModel).filter(UserModel.username == username).first()
+        if not user_obj:
+            raise ValueError("user not found")
+        user_id = user_obj.id
+    except (JWTError, ValueError, Exception):
+        await ws.close(code=1008)  # Policy Violation — invalid token
+        return
+
+    await hub.connect(user_id, ws)
+    try:
+        # Keep the connection alive; send periodic pings
+        while True:
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=30)
+            except asyncio.TimeoutError:
+                await ws.send_text('{"type":"PING"}')
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.disconnect(user_id, ws)
+
+
 # Authentication endpoints
 @app.post("/auth/register", response_model=dict)
 async def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -235,26 +292,36 @@ async def kite_login():
     return {"login_url": login_url}
 
 @app.get("/auth/kite/callback")
-async def kite_callback(
-    request_token: str,
+async def kite_callback(request_token: str):
+    """
+    Zerodha redirects here after the user logs in.
+    We forward the request_token to the frontend which exchanges it via POST /auth/kite/token.
+    """
+    from fastapi.responses import RedirectResponse
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    return RedirectResponse(url=f"{frontend_url}/kite-callback?request_token={request_token}")
+
+@app.post("/auth/kite/token")
+async def exchange_kite_token(
+    payload: dict,
     current_user: UserModel = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
     """
-    Handle Kite OAuth callback.
-    Exchanges request_token for access_token and stores it on the user record.
+    Exchange a Kite request_token for an access_token and persist it.
+    Called by the frontend after the OAuth redirect lands on /kite-callback.
     """
+    request_token = payload.get("request_token")
+    if not request_token:
+        raise HTTPException(status_code=400, detail="request_token is required")
     try:
         session = KiteService.generate_session(request_token)
-        access_token = session["access_token"]
-
-        current_user.access_token = access_token
+        current_user.access_token = session["access_token"]
         db.commit()
-
         logger.info(f"Kite access token saved for user {current_user.username}")
         return {"message": "Kite account linked successfully", "kite_user_id": session.get("user_id")}
     except Exception as e:
-        logger.error(f"Kite callback error: {e}")
+        logger.error(f"Kite token exchange error: {e}")
         raise HTTPException(status_code=400, detail="Failed to link Kite account")
 
 # Trading endpoints
@@ -263,12 +330,44 @@ async def get_instruments(
     underlying: str = "NIFTY",
     current_user: UserModel = Depends(get_current_active_user),
 ):
-    """Get available call option instruments from Kite NFO segment."""
+    """
+    Get CE option instruments for the given underlying, with live LTP attached.
+    Limits to the nearest expiry to keep the LTP batch call small.
+    """
     if not current_user.access_token:
         raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
+
     kite = KiteService(current_user.access_token)
     instruments = kite.get_option_instruments(underlying)
-    return {"instruments": instruments}
+
+    if not instruments:
+        return {"instruments": []}
+
+    # Limit to nearest expiry only to avoid rate-limit issues on LTP
+    nearest_expiry = min(inst["expiry"] for inst in instruments if inst.get("expiry"))
+    instruments = [i for i in instruments if i.get("expiry") == nearest_expiry]
+
+    # Kite LTP keys to try for the index spot price (Kite uses "NIFTY 50" with a space)
+    SPOT_CANDIDATES = {
+        "NIFTY":      ["NSE:NIFTY 50", "NSE:NIFTY50", "NSE:NIFTY"],
+        "BANKNIFTY":  ["NSE:NIFTY BANK", "NSE:BANKNIFTY"],
+        "SENSEX":     ["BSE:SENSEX"],
+    }
+    spot_candidates = SPOT_CANDIDATES.get(underlying, [f"NSE:{underlying}"])
+
+    # Batch fetch: option LTPs + all spot candidates in one call
+    symbols = [f"NFO:{i['tradingsymbol']}" for i in instruments]
+    ltp_map = kite.get_ltp(symbols + spot_candidates)
+
+    # Attach live price to each instrument
+    for inst in instruments:
+        inst["last_price"] = ltp_map.get(f"NFO:{inst['tradingsymbol']}", 0)
+
+    # Pick the first spot candidate that returned a non-zero price
+    spot_price = next((ltp_map[k] for k in spot_candidates if ltp_map.get(k, 0) > 0), 0)
+    logger.info(f"Spot price for {underlying}: {spot_price} (ltp_map keys: {list(ltp_map.keys())[:5]})")
+
+    return {"instruments": instruments, "spot_price": spot_price}
 
 @app.get("/orders", response_model=List[OrderResponse])
 async def get_orders(
@@ -695,6 +794,131 @@ async def get_suggestions(
     }
 
 
+@app.get("/rank")
+async def rank_by_win_probability(
+    underlying: str = "NIFTY",
+    max_results: int = 10,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Rank NFO call options for the given underlying by win probability.
+
+    Each instrument is scored across 9 independent factors (total 100 pts):
+      1. RSI oversold + reversal slope      (15 pts)
+      2. MACD crossover + histogram momentum (20 pts)
+      3. Bollinger Band position             (10 pts)
+      4. EMA 9 > EMA 21 trend               (10 pts)
+      5. ATR volatility window               ( 5 pts)
+      6. OI buildup on CE side              (15 pts)
+      7. Volume surge vs average            (10 pts)
+      8. Moneyness (ATM ± 2 strikes)        (10 pts)
+      9. Time-of-day window                 ( 5 pts)
+
+    Supported underlyings: NIFTY, BANKNIFTY, NIFTYNXT50, MIDCPNIFTY
+    """
+    if not current_user.access_token:
+        raise HTTPException(
+            status_code=403,
+            detail="Kite account not linked. Visit /auth/kite/login first."
+        )
+
+    # Map underlying name → Kite index instrument token (used for OHLCV)
+    UNDERLYING_TOKENS = {
+        "NIFTY":       256265,    # NSE:NIFTY 50
+        "BANKNIFTY":   260105,    # NSE:NIFTY BANK
+        "NIFTYNXT50":  270857,    # NSE:NIFTY NEXT 50  (NIFTYNXT50)
+        "MIDCPNIFTY":  288009,    # NSE:NIFTY MIDCAP SELECT
+        # Common alternate spellings
+        "NIFTYMNXT50": 270857,
+        "NIFTYMIDCAP": 288009,
+    }
+
+    token_key   = underlying.upper()
+    index_token = UNDERLYING_TOKENS.get(token_key)
+    if not index_token:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported underlying '{underlying}'. "
+                   f"Use one of: {', '.join(UNDERLYING_TOKENS.keys())}"
+        )
+
+    kite = KiteService(current_user.access_token)
+
+    # ── Single catch for ANY Kite auth/permission failure in this endpoint ────
+    # Wraps the entire block so token expiry from ANY call (validate, ltp,
+    # historical_data, quote, market_depth) returns a clean 403 to the frontend.
+    from kite_service import KiteSessionExpiredError
+    try:
+
+        # Quick upfront check — catches expired tokens before 15+ API calls
+        kite.validate_session()
+
+        instruments = kite.get_option_instruments(underlying)
+
+        if not instruments:
+            return {
+                "underlying":   underlying,
+                "spot_price":   None,
+                "ranked":       [],
+                "scanned":      0,
+                "scan_time_ms": 0,
+                "message":      f"No CE instruments found for {underlying}",
+            }
+
+        # ── Step 1: narrow to nearest expiry only ────────────────────────────
+        valid_expiries = [i["expiry"] for i in instruments if i.get("expiry")]
+        if valid_expiries:
+            nearest_expiry = min(valid_expiries)
+            instruments = [i for i in instruments if i.get("expiry") == nearest_expiry]
+
+        # ── Step 2: fetch spot price so we can sort by ATM proximity ─────────
+        SPOT_CANDIDATES = {
+            "NIFTY":       ["NSE:NIFTY 50",    "NSE:NIFTY50",   "NSE:NIFTY"],
+            "BANKNIFTY":   ["NSE:NIFTY BANK",  "NSE:BANKNIFTY"],
+            "NIFTYNXT50":  ["NSE:NIFTY NEXT 50"],
+            "MIDCPNIFTY":  ["NSE:NIFTY MIDCAP 150"],
+        }
+        spot_candidates = SPOT_CANDIDATES.get(underlying.upper(), [f"NSE:{underlying}"])
+        ltp_map    = kite.get_ltp(spot_candidates)
+        spot_price = next((ltp_map[k] for k in spot_candidates if ltp_map.get(k, 0) > 0), None)
+        logger.info(f"/rank spot_price for {underlying}: {spot_price}")
+
+        # ── Step 3: pick 15 strikes closest to ATM (or by strike order if no spot)
+        if spot_price:
+            instruments = sorted(instruments, key=lambda x: abs(x.get("strike", 0) - spot_price))[:15]
+        else:
+            strikes_sorted = sorted(instruments, key=lambda x: x.get("strike", 0))
+            mid  = len(strikes_sorted) // 2
+            half = 7
+            instruments = strikes_sorted[max(0, mid - half): mid + half + 1][:15]
+
+        logger.info(
+            f"/rank scanning {len(instruments)} instruments for {underlying} "
+            f"(expiry={nearest_expiry if valid_expiries else 'N/A'}, spot={spot_price})"
+        )
+
+        engine = WinProbabilityEngine(kite=kite)
+        result = engine.rank_instruments(
+            underlying=underlying,
+            underlying_token=index_token,
+            instruments=instruments,
+            max_results=max_results,
+            spot_price=spot_price,
+        )
+        result["message"] = (
+            f"Ranked {len(result['ranked'])} instruments (scanned {result['scanned']}) "
+            f"in {result['scan_time_ms']} ms."
+        )
+        return result
+
+    except KiteSessionExpiredError:
+        raise HTTPException(
+            status_code=403,
+            detail="KITE_TOKEN_EXPIRED: Your Kite session has expired. Please re-link your Kite account from the Dashboard.",
+        )
+
+
 @app.get("/signals/queue/{instrument}")
 async def get_signal_queue(
     instrument: str,
@@ -738,6 +962,218 @@ async def get_signal_prediction(
     kite = KiteService(current_user.access_token)
     engine = SignalEngine(kite=kite, db=db)
     return engine.get_prediction(instrument=instrument, user_id=current_user.id)
+
+
+@app.get("/margins")
+async def get_margins(current_user: UserModel = Depends(get_current_active_user)):
+    """Return available cash margin from Kite."""
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+    kite = KiteService(current_user.access_token)
+    try:
+        margins = kite.get_margins()
+        eq = margins.get("equity", {})
+        # Kite's "net" is the true spendable balance; available.cash can be 0
+        # even when funds exist (e.g. only payin/collateral funds).
+        available_cash = (
+            eq.get("net", 0)
+            or eq.get("available", {}).get("live_balance", 0)
+            or eq.get("available", {}).get("cash", 0)
+        )
+        logger.info(f"Margins raw equity keys: { {k: eq.get(k) for k in ['net','available']} }")
+        return {"available_cash": round(float(available_cash), 2), "raw": margins}
+    except Exception as e:
+        logger.error(f"Margins fetch error: {e}")
+        raise HTTPException(status_code=502, detail="Could not fetch margins from Kite")
+
+
+@app.get("/dashboard/summary")
+async def dashboard_summary(
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Single endpoint for the Dashboard page.
+    Returns: available cash, total orders, open positions, today's P&L.
+    Fetches Kite margin in one call so the frontend doesn't need a separate request.
+    """
+    orders = db.query(OrderModel).filter(OrderModel.user_id == current_user.id).all()
+    total_pnl   = sum(o.profit_loss or 0 for o in orders)
+    open_pos    = sum(1 for o in orders if o.order_type == "BUY" and o.status == "EXECUTED" and o.exit_price is None)
+    executed    = sum(1 for o in orders if o.status == "EXECUTED")
+
+    available_cash = 0.0
+    if current_user.access_token:
+        try:
+            kite = KiteService(current_user.access_token)
+            available_cash = kite.get_available_cash()
+        except Exception as e:
+            logger.warning(f"Could not fetch cash for dashboard summary: {e}")
+
+    return {
+        "available_cash"  : round(available_cash, 2),
+        "total_orders"    : len(orders),
+        "executed_orders" : executed,
+        "open_positions"  : open_pos,
+        "total_pnl"       : round(total_pnl, 2),
+        "kite_linked"     : bool(current_user.access_token),
+        "monitor_running" : pm.is_running(current_user.id),
+    }
+
+
+@app.post("/sync/orders")
+async def sync_orders_from_kite(
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Pull today's orders from Kite and upsert them into the local DB.
+
+    Use this to recover from a DB wipe — after logging in, hit this endpoint
+    and all your Kite orders for the day will be restored locally.
+
+    The upsert logic:
+      - Match on broker_order_id
+      - If not in DB → insert with status mapped from Kite status
+      - If already in DB → update status and average price
+    Returns a summary: { inserted, updated, total_kite_orders }
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite = KiteService(current_user.access_token)
+    kite_orders = kite.get_all_kite_orders()
+
+    STATUS_MAP = {
+        "COMPLETE"  : "EXECUTED",
+        "OPEN"      : "PENDING",
+        "CANCELLED" : "CANCELLED",
+        "REJECTED"  : "CANCELLED",
+        "PENDING"   : "PENDING",
+    }
+
+    inserted = updated = 0
+    for ko in kite_orders:
+        broker_id = str(ko.get("order_id", ""))
+        if not broker_id:
+            continue
+
+        existing = db.query(OrderModel).filter(
+            OrderModel.broker_order_id == broker_id,
+            OrderModel.user_id         == current_user.id,
+        ).first()
+
+        kite_status = STATUS_MAP.get(ko.get("status", ""), "PENDING")
+        avg_price   = float(ko.get("average_price") or ko.get("price") or 0)
+        txn_type    = "BUY" if ko.get("transaction_type") == "BUY" else "SELL"
+        qty         = int(ko.get("quantity") or 0)
+        symbol      = ko.get("tradingsymbol", "")
+
+        if existing:
+            # Update status + execution price if it changed
+            existing.status = kite_status
+            if avg_price and existing.status == "EXECUTED":
+                existing.entry_price = avg_price if txn_type == "BUY" else existing.entry_price
+                existing.exit_price  = avg_price if txn_type == "SELL" else existing.exit_price
+            updated += 1
+        else:
+            new_row = OrderModel(
+                user_id        = current_user.id,
+                instrument     = symbol,
+                quantity       = qty,
+                price          = avg_price,
+                order_type     = txn_type,
+                status         = kite_status,
+                broker_order_id= broker_id,
+                entry_price    = avg_price if txn_type == "BUY" and kite_status == "EXECUTED" else None,
+            )
+            db.add(new_row)
+            inserted += 1
+
+    db.commit()
+    logger.info(
+        f"Kite sync for user {current_user.username}: "
+        f"{inserted} inserted, {updated} updated from {len(kite_orders)} Kite orders"
+    )
+    return {
+        "message"           : f"Synced {len(kite_orders)} Kite orders → {inserted} new, {updated} updated",
+        "total_kite_orders" : len(kite_orders),
+        "inserted"          : inserted,
+        "updated"           : updated,
+    }
+
+
+@app.get("/signal/analyze/{tradingsymbol}")
+async def analyze_instrument(
+    tradingsymbol: str,
+    instrument_token: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Full signal analysis for a single instrument:
+      - Live indicator snapshot (RSI, MACD, trend)
+      - Signal direction + confidence score
+      - Queue prediction (STRONG_BUY / BUY / HOLD / MIXED)
+      - Success rate: % of recent BUY signals with confidence ≥ 60
+
+    When the option itself has insufficient candles (<30), the engine
+    automatically falls back to the underlying index's history.
+    NIFTY options → NSE:NIFTY 50  (token 256265)
+    BANKNIFTY options → NSE:NIFTY BANK (token 260105)
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    # Auto-detect the underlying token for fallback OHLCV fetch
+    UNDERLYING_TOKENS = {
+        "NIFTY":     256265,   # NSE:NIFTY 50
+        "BANKNIFTY": 260105,   # NSE:NIFTY BANK
+        "SENSEX":    265,      # BSE:SENSEX
+    }
+    underlying_token = next(
+        (tok for prefix, tok in UNDERLYING_TOKENS.items() if tradingsymbol.startswith(prefix)),
+        None,
+    )
+
+    kite   = KiteService(current_user.access_token)
+    engine = SignalEngine(kite=kite, db=db)
+
+    # Run full signal evaluation (persists to DB)
+    signal = engine.evaluate(
+        tradingsymbol=tradingsymbol,
+        instrument_token=instrument_token,
+        user_id=current_user.id,
+        underlying_token=underlying_token,
+    )
+
+    # Aggregate prediction from recent queue
+    prediction = engine.get_prediction(instrument=tradingsymbol, user_id=current_user.id)
+
+    # Success rate: % of last 20 BUY signals that had confidence ≥ 60
+    recent_buys = (
+        db.query(SignalRecordModel)
+        .filter(
+            SignalRecordModel.instrument == tradingsymbol,
+            SignalRecordModel.user_id == current_user.id,
+            SignalRecordModel.direction == "BUY",
+        )
+        .order_by(SignalRecordModel.evaluated_at.desc())
+        .limit(20)
+        .all()
+    )
+    if recent_buys:
+        high_conf = sum(1 for r in recent_buys if r.confidence >= 60)
+        success_rate = round(high_conf / len(recent_buys) * 100)
+    else:
+        success_rate = None   # no history yet
+
+    return {
+        "signal":       signal,
+        "prediction":   prediction,
+        "success_rate": success_rate,
+        "signal_count": len(recent_buys),
+    }
 
 
 @app.get("/strategies", response_model=List[StrategyResponse])

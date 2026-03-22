@@ -20,6 +20,7 @@ from typing import Dict, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session, joinedload
 
+from alert_hub import hub
 from database import SessionLocal
 from kite_service import KiteService
 from models import AlertType, MonitoringSession, Order, PositionAlert
@@ -27,9 +28,9 @@ from models import AlertType, MonitoringSession, Order, PositionAlert
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PROFIT_TARGET_MIN  = float(os.getenv("PROFIT_TARGET_MIN", 300))
-PROFIT_TARGET_MAX  = float(os.getenv("PROFIT_TARGET_MAX", 500))
-DEFAULT_SL_PCT     = float(os.getenv("STOP_LOSS_PERCENTAGE", 3))
+# Both profit and stop-loss are now percentage-based (symmetric ±3%).
+PROFIT_TARGET_PCT  = float(os.getenv("PROFIT_TARGET_PCT", 3))   # exit on +3%
+DEFAULT_SL_PCT     = float(os.getenv("STOP_LOSS_PERCENTAGE", 3)) # exit on -3%
 POLL_INTERVAL_SEC  = 60
 WATCHING_EVERY_N   = 5   # write a WATCHING alert every N cycles (~5 min)
 
@@ -68,20 +69,19 @@ def _check_exit(
     pnl_r = round(pnl, 2)
     pct_r = round(pnl_pct, 2)
 
+    profit_pct = PROFIT_TARGET_PCT
+
     if _is_force_exit_time():
-        return True, AlertType.FORCE_EXIT, f"Market closing — force exit | P&L ₹{pnl:+.2f}", pnl_r, pct_r
+        return True, AlertType.FORCE_EXIT, f"Market closing — force exit | P&L ₹{pnl:+.2f} ({pct_r:+.2f}%)", pnl_r, pct_r
 
-    if PROFIT_TARGET_MIN <= pnl <= PROFIT_TARGET_MAX:
+    if pnl_pct >= profit_pct:
         return True, AlertType.PROFIT_TARGET, (
-            f"Profit target hit ₹{pnl:+.2f} (range ₹{PROFIT_TARGET_MIN}–{PROFIT_TARGET_MAX}) — exiting"
+            f"🎯 Profit target hit +{pnl_pct:.2f}% (target +{profit_pct}%) | ₹{pnl:+.2f} — exiting"
         ), pnl_r, pct_r
-
-    if pnl > PROFIT_TARGET_MAX:
-        return True, AlertType.EXTENDED_PROFIT, f"Extended profit ₹{pnl:+.2f} — exiting before reversal", pnl_r, pct_r
 
     if pnl_pct <= -sl_pct:
         return True, AlertType.STOP_LOSS, (
-            f"Stop-loss breached {pnl_pct:.2f}% (limit -{sl_pct}%) | ₹{pnl:+.2f} — cutting loss"
+            f"🛑 Stop-loss hit {pnl_pct:.2f}% (limit -{sl_pct}%) | ₹{pnl:+.2f} — cutting loss"
         ), pnl_r, pct_r
 
     return False, AlertType.WATCHING, (
@@ -208,6 +208,19 @@ class PositionMonitor:
         )
         self.db.commit()
         logger.info(f"[Monitor] ✓ EXIT {order.instrument} @ ₹{current_price:.2f} P&L=₹{pnl_actual:+.2f} | {reason}")
+
+        # Push real-time alert to any connected WebSocket clients
+        hub.broadcast(user_id, {
+            "type":          "ALERT",
+            "alert_type":    alert_type,
+            "instrument":    order.instrument,
+            "current_price": current_price,
+            "entry_price":   order.entry_price,
+            "pnl":           round(pnl_actual, 2),
+            "pnl_pct":       round(pnl_pct, 2) if pnl_pct is not None else None,
+            "message":       reason,
+            "actioned":      True,
+        })
         return True
 
     def run_once(self, user_id: int, cycle_num: int) -> None:
@@ -256,6 +269,16 @@ class PositionMonitor:
                     pnl_pct       = pnl_pct,
                 )
                 self.db.commit()
+                # Push live position update to WebSocket
+                hub.broadcast(user_id, {
+                    "type":          "WATCHING",
+                    "instrument":    order.instrument,
+                    "current_price": current_price,
+                    "entry_price":   order.entry_price,
+                    "pnl":           round(pnl, 2) if pnl is not None else None,
+                    "pnl_pct":       round(pnl_pct, 2) if pnl_pct is not None else None,
+                    "message":       message,
+                })
 
 
 # ── Async loop ────────────────────────────────────────────────────────────────
