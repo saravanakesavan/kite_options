@@ -26,9 +26,14 @@ const Login = () => {
     setError('');
 
     const result = await login(formData.username, formData.password);
-    
+
     if (result.success) {
-      navigate('/dashboard');
+      // If the user was redirected here mid-Kite OAuth flow, finish the exchange
+      if (sessionStorage.getItem('kite_pending_token')) {
+        navigate('/kite-callback', { replace: true });
+      } else {
+        navigate('/dashboard');
+      }
     } else {
       setError(result.error);
     }
