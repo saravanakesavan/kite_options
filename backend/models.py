@@ -208,15 +208,53 @@ class TradingSession(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    
+
     # Session details
     session_date = Column(DateTime(timezone=True), server_default=func.now())
     total_trades = Column(Integer, default=0)
     successful_trades = Column(Integer, default=0)
     total_pnl = Column(Float, default=0.0)
-    
+
     # Session status
     is_active = Column(Boolean, default=True)
-    
+
     # Relationships
+    user = relationship("User")
+
+
+class MockTrade(Base):
+    """
+    Paper / mock trade record.
+    Stores the entry price at 'buy' time and lets the frontend
+    compute live P&L by comparing against Kite LTP.
+    Max 5 open positions per user enforced at the API layer.
+    """
+    __tablename__ = "mock_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Instrument details
+    instrument = Column(String(100), nullable=False)   # e.g. "NIFTY25JUN24500CE"
+    quantity = Column(Integer, nullable=False, default=1)
+    entry_price = Column(Float, nullable=False)        # LTP at time of mock-buy
+
+    # Optional label / notes
+    notes = Column(String(255), nullable=True)
+
+    # Win Probability engine score at time of mock-buy (for performance analytics)
+    # NULL if trade was opened manually (not from Win Probability page)
+    win_probability_score = Column(Float, nullable=True)   # 0–100
+    win_probability_grade = Column(String(4), nullable=True)  # A+/A/B/C/D
+
+    # Timestamps
+    entry_time = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    # Status: OPEN | CLOSED
+    status = Column(String(10), default="OPEN", nullable=False)
+
+    # Exit tracking (filled when user closes position)
+    exit_price = Column(Float, nullable=True)
+    exit_time = Column(DateTime(timezone=True), nullable=True)
+
     user = relationship("User")

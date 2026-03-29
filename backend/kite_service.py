@@ -46,16 +46,37 @@ class KiteService:
 
     def validate_session(self) -> None:
         """
-        Perform a cheap API call to verify the access token is still valid.
+        Validate the access token against a market-data endpoint.
         Raises KiteSessionExpiredError if the token has expired or is invalid.
-        Call this at the start of any heavy endpoint before doing 15+ API calls.
+        Raises KitePermissionError if the API key lacks market-data permissions.
+
+        NOTE: profile() does NOT reliably catch expired tokens — some Kite plans
+        let profile() succeed while ltp/quote/historical fail with PermissionException.
+        We use ltp(NIFTY 50) as the canary since it's the same scope as ranking endpoints.
         """
         try:
-            # profile() is the lightest authenticated endpoint Kite offers
-            self.kite.profile()
+            result = self.kite.ltp(["NSE:NIFTY 50"])
+            if not result:
+                raise KiteSessionExpiredError(
+                    "Kite session check returned empty response — please re-link."
+                )
+        except (KiteSessionExpiredError, KitePermissionError):
+            raise  # already the right type
         except Exception as e:
             err_str = str(e).lower()
-            if any(kw in err_str for kw in ("permission", "token", "invalid", "auth",
+            if "permission" in err_str:
+                # PermissionException on market data = Personal plan limitation.
+                # The free Kite Connect Personal plan has NO market data access at all
+                # (no ltp, no quote, no historical data). Re-linking will NOT fix this.
+                # Fix: create a paid Kite Connect app at developers.kite.trade (₹500/month).
+                # Historical data is included free with the paid plan (no extra add-on needed).
+                raise KitePermissionError(
+                    "KITE_NO_MARKET_DATA: Your API key is on the Kite Connect Personal plan "
+                    "which does not include market data (ltp/quote/historical). "
+                    "Create a paid Kite Connect app at developers.kite.trade (₹500/month). "
+                    "Historical data is included free with the paid plan."
+                ) from e
+            if any(kw in err_str for kw in ("token", "invalid", "auth",
                                              "403", "401", "session", "expired")):
                 raise KiteSessionExpiredError(
                     f"Kite session expired — please re-link your Kite account. (raw: {e})"
@@ -395,5 +416,15 @@ class KiteService:
 
 
 class KiteSessionExpiredError(Exception):
-    """Raised when Kite returns an auth/token error during historical data fetch."""
+    """Raised when the Kite access token has expired (re-link required)."""
+    pass
+
+
+class KitePermissionError(Exception):
+    """
+    Raised when the Kite Connect API key lacks permissions for market data
+    (ltp / quote / historical data).  This is a SUBSCRIPTION issue — re-linking
+    the account will NOT fix it.  The developer must upgrade their Kite Connect
+    app plan at https://developers.kite.trade.
+    """
     pass

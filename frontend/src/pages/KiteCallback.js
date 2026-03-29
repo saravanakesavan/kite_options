@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { kiteAPI } from '../services/api';
 import { useAuth } from '../services/AuthContext';
@@ -7,10 +7,29 @@ const KiteCallback = () => {
   const [status, setStatus] = useState('linking'); // 'linking' | 'success' | 'error'
   const [errorMsg, setErrorMsg] = useState('');
   const navigate = useNavigate();
-  const { user, refreshUser } = useAuth();
+  // Also consume `loading` so we wait for the auth check to finish
+  const { user, loading, refreshUser } = useAuth();
+  // Prevent double-exchange if useEffect fires twice (StrictMode / user re-render)
+  const exchangedRef = useRef(false);
 
   useEffect(() => {
+    // ── Wait for AuthProvider to finish its initial token check ──────────────
+    // Without this guard, the effect fires with user=null while checkAuthStatus()
+    // is still in-flight, causing an unnecessary redirect to /login every time.
+    if (loading) return;
+
+    // Prevent double exchange (StrictMode double-invoke, or user state re-render)
+    if (exchangedRef.current) return;
+
     const params = new URLSearchParams(window.location.search);
+
+    // Handle user cancellation on Zerodha's side
+    if (params.get('error') === 'cancelled') {
+      setStatus('error');
+      setErrorMsg('Kite login was cancelled. Please try again.');
+      return;
+    }
+
     const requestToken =
       params.get('request_token') || sessionStorage.getItem('kite_pending_token');
 
@@ -20,12 +39,15 @@ const KiteCallback = () => {
       return;
     }
 
-    // If not logged in, stash the token and redirect to login first
+    // If not logged in after auth check completes → stash & redirect to login
     if (!user) {
       sessionStorage.setItem('kite_pending_token', requestToken);
       navigate('/login?kite_redirect=1', { replace: true });
       return;
     }
+
+    // Mark as in-progress to prevent double-exchange
+    exchangedRef.current = true;
 
     // Logged in — clear the stash and exchange the token
     sessionStorage.removeItem('kite_pending_token');
@@ -37,10 +59,12 @@ const KiteCallback = () => {
         setTimeout(() => navigate('/dashboard'), 1500);
       })
       .catch((err) => {
+        exchangedRef.current = false; // allow retry on error
         setStatus('error');
-        setErrorMsg(err.response?.data?.detail || 'Failed to link Kite account.');
+        const detail = err.response?.data?.detail || 'Failed to link Kite account.';
+        setErrorMsg(detail);
       });
-  }, [user]); // re-run when user becomes available after login redirect
+  }, [loading, user]); // re-run when loading completes OR user becomes available
 
   return (
     <div className="min-h-screen bg-gray-100 flex items-center justify-center">

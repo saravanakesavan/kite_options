@@ -22,6 +22,7 @@ from models import (
     Order as OrderModel,
     TradingStrategy as StrategyModel,
     PositionAlert as AlertModel,
+    MockTrade as MockTradeModel,
 )
 from dotenv import load_dotenv
 
@@ -36,7 +37,7 @@ try:
 except ImportError as e:
     logger.warning(f"Trading engine import failed: {e}. Some features may be limited.")
 
-from kite_service import KiteService
+from kite_service import KiteService, KiteSessionExpiredError, KitePermissionError
 from signal_engine import SignalEngine
 from win_probability_engine import WinProbabilityEngine
 from models import SignalRecord as SignalRecordModel
@@ -44,12 +45,67 @@ import position_monitor as pm
 from alert_hub import hub
 from jose import jwt, JWTError
 from auth import SECRET_KEY, ALGORITHM
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="Options Trading App",
-    description="Automated call options trading system with ₹10,000 cap per trade",
+    description="Automated call options trading system for Zerodha Kite",
     version="1.0.0"
 )
+
+# ── Global Kite session expiry handler ────────────────────────────────────────
+# Catches KiteSessionExpiredError from ANY endpoint automatically.
+# Returns a clean 403 with the KITE_TOKEN_EXPIRED prefix so the frontend
+# can detect it and show the "Re-link Kite" banner instead of a generic error.
+# CORS headers are added manually because FastAPI exception handlers fire
+# before CORS middleware can inject them.
+@app.exception_handler(KiteSessionExpiredError)
+async def kite_session_expired_handler(request: Request, exc: KiteSessionExpiredError):
+    origin = request.headers.get("origin", "")
+    _allowed = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    cors_origin = origin if origin in _allowed else (_allowed[0] if _allowed else "*")
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": (
+                "KITE_TOKEN_EXPIRED: Your Kite session has expired. "
+                "Please re-link your Kite account from the Dashboard."
+            )
+        },
+        headers={
+            "Access-Control-Allow-Origin":      cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+
+
+@app.exception_handler(KitePermissionError)
+async def kite_permission_error_handler(request: Request, exc: KitePermissionError):
+    """
+    Handles KitePermissionError — raised when the API key lacks market data permissions.
+    This is a Kite Connect subscription issue, NOT a token expiry.
+    Re-linking will NOT fix it; the developer must upgrade their plan.
+    """
+    origin = request.headers.get("origin", "")
+    _allowed = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    cors_origin = origin if origin in _allowed else (_allowed[0] if _allowed else "*")
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": (
+                "KITE_NO_MARKET_DATA: Your API key is on the Kite Connect Personal plan "
+                "which has no market data access (no quotes, no historical data). "
+                "Create a paid Kite Connect app at developers.kite.trade (Rs 500/month) — "
+                "historical data is included free. Re-linking will NOT fix this."
+            )
+        },
+        headers={
+            "Access-Control-Allow-Origin":      cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+
 
 # CORS middleware to allow frontend connections
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
@@ -101,10 +157,11 @@ class UserResponse(BaseModel):
 
 class OrderCreate(BaseModel):
     instrument: str
-    quantity: int
-    price: float
-    order_type: str                         # "BUY" or "SELL"
-    stop_loss_percentage: float = 3.0       # default 3% SL on BUY orders
+    quantity: int           # number of LOTS (1 lot = lot_size units on Kite)
+    lot_size: int = 1       # Kite lot_size for the instrument (e.g. 25 for NIFTY, 15 for BANKNIFTY)
+    price: float            # option premium per unit (limit price sent to Kite)
+    order_type: str         # "BUY" or "SELL" (transaction direction)
+    stop_loss_percentage: float = 3.0   # SL % on the premium price (default 3%)
 
 class OrderModify(BaseModel):
     price: Optional[float] = None
@@ -292,13 +349,27 @@ async def kite_login():
     return {"login_url": login_url}
 
 @app.get("/auth/kite/callback")
-async def kite_callback(request_token: str):
+async def kite_callback(
+    request: Request,
+    request_token: Optional[str] = None,
+    action: Optional[str] = None,
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+):
     """
-    Zerodha redirects here after the user logs in.
-    We forward the request_token to the frontend which exchanges it via POST /auth/kite/token.
+    Zerodha redirects here after the user logs in (or cancels).
+    Zerodha sends: ?action=login&type=login&status=success&request_token=XXX
+    On user-cancel: ?action=login&type=login&status=error (no request_token)
+    We forward to the frontend which exchanges via POST /auth/kite/token.
     """
     from fastapi.responses import RedirectResponse
     frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+    if not request_token or status == "error":
+        logger.warning(f"Kite callback received without request_token — action={action} status={status}")
+        return RedirectResponse(url=f"{frontend_url}/kite-callback?error=cancelled")
+
+    logger.info(f"Kite callback received — action={action} status={status} token_prefix={request_token[:8]}...")
     return RedirectResponse(url=f"{frontend_url}/kite-callback?request_token={request_token}")
 
 @app.post("/auth/kite/token")
@@ -321,8 +392,13 @@ async def exchange_kite_token(
         logger.info(f"Kite access token saved for user {current_user.username}")
         return {"message": "Kite account linked successfully", "kite_user_id": session.get("user_id")}
     except Exception as e:
-        logger.error(f"Kite token exchange error: {e}")
-        raise HTTPException(status_code=400, detail="Failed to link Kite account")
+        # Surface the real Kite error so the frontend / user can act on it
+        err_msg = str(e)
+        logger.error(f"Kite token exchange error for user {current_user.username}: {type(e).__name__}: {err_msg}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to link Kite account: {err_msg}",
+        )
 
 # Trading endpoints
 @app.get("/instruments")
@@ -331,43 +407,66 @@ async def get_instruments(
     current_user: UserModel = Depends(get_current_active_user),
 ):
     """
-    Get CE option instruments for the given underlying, with live LTP attached.
-    Limits to the nearest expiry to keep the LTP batch call small.
+    Get CE option instruments for the given underlying.
+    Live LTP is attached when market data is available (paid Kite Connect plan).
+    Falls back to static instrument data (strike / expiry / lot_size) when LTP
+    is unavailable — the instruments list itself is always free.
     """
     if not current_user.access_token:
         raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
 
     kite = KiteService(current_user.access_token)
+
+    # Validate session — raises KiteSessionExpiredError (→ 403) or KitePermissionError (→ 403)
+    # but only for token expiry. Permission errors for market data are handled below gracefully.
+    try:
+        kite.validate_session()
+        market_data_available = True
+    except KitePermissionError:
+        market_data_available = False   # plan doesn't include market data — degrade gracefully
+    # KiteSessionExpiredError still propagates to global handler → 403 KITE_TOKEN_EXPIRED
+
     instruments = kite.get_option_instruments(underlying)
 
     if not instruments:
-        return {"instruments": []}
+        return {"instruments": [], "spot_price": None, "market_data_available": market_data_available}
 
-    # Limit to nearest expiry only to avoid rate-limit issues on LTP
+    # Limit to nearest expiry only
     nearest_expiry = min(inst["expiry"] for inst in instruments if inst.get("expiry"))
     instruments = [i for i in instruments if i.get("expiry") == nearest_expiry]
 
-    # Kite LTP keys to try for the index spot price (Kite uses "NIFTY 50" with a space)
-    SPOT_CANDIDATES = {
-        "NIFTY":      ["NSE:NIFTY 50", "NSE:NIFTY50", "NSE:NIFTY"],
-        "BANKNIFTY":  ["NSE:NIFTY BANK", "NSE:BANKNIFTY"],
-        "SENSEX":     ["BSE:SENSEX"],
+    spot_price = None
+
+    if market_data_available:
+        # Kite LTP keys to try for the index spot price
+        SPOT_CANDIDATES = {
+            "NIFTY":      ["NSE:NIFTY 50", "NSE:NIFTY50", "NSE:NIFTY"],
+            "BANKNIFTY":  ["NSE:NIFTY BANK", "NSE:BANKNIFTY"],
+            "SENSEX":     ["BSE:SENSEX"],
+        }
+        spot_candidates = SPOT_CANDIDATES.get(underlying, [f"NSE:{underlying}"])
+
+        # Batch fetch: option LTPs + all spot candidates in one call
+        symbols = [f"NFO:{i['tradingsymbol']}" for i in instruments]
+        ltp_map = kite.get_ltp(symbols + spot_candidates)
+
+        # Attach live price to each instrument
+        for inst in instruments:
+            inst["last_price"] = ltp_map.get(f"NFO:{inst['tradingsymbol']}", 0)
+
+        spot_price = next((ltp_map[k] for k in spot_candidates if ltp_map.get(k, 0) > 0), None)
+        logger.info(f"Spot price for {underlying}: {spot_price}")
+    else:
+        # No LTP available — set last_price = 0 for all (instruments() static dump is always 0)
+        for inst in instruments:
+            inst["last_price"] = 0
+        logger.info(f"/instruments: market data unavailable, returning static instrument list for {underlying}")
+
+    return {
+        "instruments":            instruments,
+        "spot_price":             spot_price,
+        "market_data_available":  market_data_available,
     }
-    spot_candidates = SPOT_CANDIDATES.get(underlying, [f"NSE:{underlying}"])
-
-    # Batch fetch: option LTPs + all spot candidates in one call
-    symbols = [f"NFO:{i['tradingsymbol']}" for i in instruments]
-    ltp_map = kite.get_ltp(symbols + spot_candidates)
-
-    # Attach live price to each instrument
-    for inst in instruments:
-        inst["last_price"] = ltp_map.get(f"NFO:{inst['tradingsymbol']}", 0)
-
-    # Pick the first spot candidate that returned a non-zero price
-    spot_price = next((ltp_map[k] for k in spot_candidates if ltp_map.get(k, 0) > 0), 0)
-    logger.info(f"Spot price for {underlying}: {spot_price} (ltp_map keys: {list(ltp_map.keys())[:5]})")
-
-    return {"instruments": instruments, "spot_price": spot_price}
 
 @app.get("/orders", response_model=List[OrderResponse])
 async def get_orders(
@@ -384,83 +483,109 @@ async def place_order(
     current_user: UserModel = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Place a new trading order"""
-    try:
-        # Validate investment cap
-        order_value = order.price * order.quantity
-        if order_value > 10000:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Order value ₹{order_value:.2f} exceeds ₹10,000 limit"
-            )
-        
-        if not current_user.access_token:
-            raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
+    """
+    Place a real options order on Zerodha Kite.
 
-        # Place order on Zerodha Kite
+    quantity  = number of LOTS entered by the user (e.g. 1, 2, 3…)
+    lot_size  = Kite lot_size for the instrument (e.g. 25 for NIFTY, 15 for BANKNIFTY)
+    price     = option premium per unit (sent as the LIMIT price to Kite)
+
+    Kite requires quantity = lots × lot_size.
+    Capital outlay = price × lots × lot_size.
+    """
+    try:
+        lot_size      = max(1, order.lot_size)   # guard against 0
+        kite_quantity = order.quantity * lot_size  # actual units sent to Kite
+
+        if not current_user.access_token:
+            raise HTTPException(
+                status_code=403,
+                detail="Kite account not linked. Visit Dashboard → Connect Kite first.",
+            )
+
+        # ── Place the main order on Kite ───────────────────────────────────────
         kite = KiteService(current_user.access_token)
         broker_order_id = kite.place_order(
             tradingsymbol=order.instrument,
-            transaction_type=order.order_type,
-            quantity=order.quantity,
-            order_type="LIMIT" if order.price else "MARKET",
-            price=order.price if order.price else None,
+            transaction_type=order.order_type,   # "BUY" or "SELL"
+            quantity=kite_quantity,               # lots × lot_size
+            order_type="LIMIT",                  # always LIMIT for options (price is required)
+            price=order.price,
         )
 
         if broker_order_id is None:
-            raise HTTPException(status_code=502, detail="Kite order placement failed")
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Kite rejected the order. Possible reasons: market closed, "
+                    "invalid instrument, insufficient margin, or expired session."
+                ),
+            )
 
-        # For BUY orders: attach a Stop-Loss Market (SL-M) SELL order
+        # ── Attach a Stop-Loss Market (SL-M) SELL order for BUY positions ──────
         sl_broker_order_id = None
-        sl_trigger_price = None
+        sl_trigger_price   = None
         if order.order_type == "BUY":
-            sl_pct = max(0.5, min(order.stop_loss_percentage, 50))  # clamp 0.5–50%
+            sl_pct           = max(0.5, min(order.stop_loss_percentage, 50))  # clamp 0.5–50%
             sl_trigger_price = round(order.price * (1 - sl_pct / 100), 1)
             sl_broker_order_id = kite.place_sl_order(
                 tradingsymbol=order.instrument,
-                quantity=order.quantity,
+                quantity=kite_quantity,           # same units as the buy order
                 trigger_price=sl_trigger_price,
             )
             if sl_broker_order_id:
-                logger.info(f"SL order placed: trigger=₹{sl_trigger_price} ({sl_pct}%), broker_sl_id={sl_broker_order_id}")
+                logger.info(
+                    f"SL-M order placed: trigger=₹{sl_trigger_price} ({sl_pct}%), "
+                    f"broker_sl_id={sl_broker_order_id}"
+                )
             else:
-                logger.warning("SL order placement failed — proceeding without SL")
+                logger.warning(
+                    f"SL order placement failed for {order.instrument} — "
+                    f"position is live WITHOUT a stop-loss on Kite."
+                )
 
-        # Persist to local DB
+        # ── Persist to local DB ────────────────────────────────────────────────
+        # Store lots (user-facing quantity) in the DB, not kite_quantity.
+        # kite_quantity can always be recovered as quantity * lot_size.
         new_order = OrderModel(
-            user_id=current_user.id,
-            instrument=order.instrument,
-            quantity=order.quantity,
-            price=order.price,
-            order_type=order.order_type,
-            status='PENDING',
-            broker_order_id=broker_order_id,
-            entry_price=order.price if order.order_type == 'BUY' else None,
-            sl_percentage=order.stop_loss_percentage if order.order_type == 'BUY' else None,
-            sl_trigger_price=sl_trigger_price,
-            sl_broker_order_id=sl_broker_order_id,
+            user_id            = current_user.id,
+            instrument         = order.instrument,
+            quantity           = order.quantity,  # lots
+            price              = order.price,
+            order_type         = order.order_type,
+            status             = "PENDING",       # will sync to EXECUTED once Kite confirms
+            broker_order_id    = broker_order_id,
+            entry_price        = order.price if order.order_type == "BUY" else None,
+            sl_percentage      = order.stop_loss_percentage if order.order_type == "BUY" else None,
+            sl_trigger_price   = sl_trigger_price,
+            sl_broker_order_id = sl_broker_order_id,
         )
 
         db.add(new_order)
         db.commit()
         db.refresh(new_order)
 
-        logger.info(f"Order placed: {order.instrument} - {order.quantity} @ ₹{order.price} by user {current_user.username}, broker_id={broker_order_id}")
+        logger.info(
+            f"Order placed: {order.order_type} {order.quantity} lot(s) "
+            f"[{kite_quantity} units] {order.instrument} @ ₹{order.price} "
+            f"by {current_user.username}, broker_id={broker_order_id}"
+        )
 
         return {
-            "message": "Order placed successfully",
-            "order_id": new_order.id,
-            "broker_order_id": broker_order_id,
+            "message"           : "Order placed successfully on Kite",
+            "order_id"          : new_order.id,
+            "broker_order_id"   : broker_order_id,
+            "kite_quantity"     : kite_quantity,
             "sl_broker_order_id": sl_broker_order_id,
-            "sl_trigger_price": sl_trigger_price,
-            "status": "PENDING",
+            "sl_trigger_price"  : sl_trigger_price,
+            "status"            : "PENDING",
         }
     except HTTPException as he:
         raise he
     except Exception as e:
         logger.error(f"Order placement error: {str(e)}")
         db.rollback()
-        raise HTTPException(status_code=400, detail="Order placement failed")
+        raise HTTPException(status_code=400, detail=f"Order placement failed: {str(e)}")
 
 @app.put("/orders/{order_id}")
 async def modify_order(
@@ -609,6 +734,156 @@ async def reverse_order_on_profit(
     }
 
 
+@app.post("/orders/{order_id}/sync-status")
+async def sync_order_status(
+    order_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Poll Kite for the real execution status of an order and sync it to the local DB.
+
+    Call this from the frontend after placing an order to check whether it has been
+    EXECUTED (filled) or REJECTED on Kite.
+
+    Kite order statuses we map:
+      COMPLETE  → EXECUTED   (fully filled)
+      REJECTED  → REJECTED
+      CANCELLED → CANCELLED
+      OPEN / TRIGGER PENDING / AMO REQ RECEIVED → PENDING (still outstanding)
+    """
+    db_order = db.query(OrderModel).filter(
+        OrderModel.id      == order_id,
+        OrderModel.user_id == current_user.id,
+    ).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if not db_order.broker_order_id:
+        raise HTTPException(status_code=400, detail="Order has no broker_order_id — cannot sync")
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite        = KiteService(current_user.access_token)
+    kite_order  = kite.get_order_status(db_order.broker_order_id)
+    if not kite_order:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not fetch order {db_order.broker_order_id} from Kite",
+        )
+
+    kite_status = kite_order.get("status", "").upper()
+    prev_status = db_order.status
+
+    # Map Kite status → local status
+    if kite_status == "COMPLETE":
+        db_order.status      = "EXECUTED"
+        db_order.executed_at = kite_order.get("exchange_update_timestamp") or datetime.now()
+        # Use average fill price if available
+        avg_price = kite_order.get("average_price") or kite_order.get("price")
+        if avg_price:
+            db_order.entry_price = float(avg_price)
+            db_order.price       = float(avg_price)
+    elif kite_status == "REJECTED":
+        db_order.status = "REJECTED"
+    elif kite_status == "CANCELLED":
+        db_order.status = "CANCELLED"
+    else:
+        db_order.status = "PENDING"   # still outstanding
+
+    db.commit()
+    db.refresh(db_order)
+
+    logger.info(
+        f"Order {order_id} status synced: {prev_status} → {db_order.status} "
+        f"(Kite: {kite_status})"
+    )
+    return {
+        "order_id"        : order_id,
+        "broker_order_id" : db_order.broker_order_id,
+        "prev_status"     : prev_status,
+        "new_status"      : db_order.status,
+        "kite_status"     : kite_status,
+        "average_price"   : kite_order.get("average_price"),
+    }
+
+
+@app.post("/orders/{order_id}/exit")
+async def exit_position(
+    order_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Close (exit) an open BUY position at the current market price.
+
+    Steps:
+      1. Fetch current LTP from Kite
+      2. Place a SELL MARKET order on Kite for the same instrument + quantity
+      3. Cancel any attached SL-M order so it doesn't fire after the exit
+      4. Record exit price + P&L in the local DB
+      5. Return full summary to the frontend
+    """
+    db_order = db.query(OrderModel).filter(
+        OrderModel.id       == order_id,
+        OrderModel.user_id  == current_user.id,
+        OrderModel.order_type == "BUY",
+    ).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="BUY order not found")
+    if db_order.status not in ("EXECUTED", "PENDING"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot exit order in status '{db_order.status}'",
+        )
+    if db_order.exit_price is not None:
+        raise HTTPException(status_code=400, detail="Position already closed")
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    kite = KiteService(current_user.access_token)
+
+    # ── 1. Current LTP ────────────────────────────────────────────────────────
+    symbol        = f"NFO:{db_order.instrument}"
+    current_price = kite.get_ltp([symbol]).get(symbol)
+    if not current_price:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not fetch live price from Kite — market may be closed",
+        )
+
+    # ── 2. Determine kite_quantity (lot_size is stored in Order or defaulted) ─
+    # We store lots in the DB; use sl_percentage presence to hint at lot_size
+    # Best-effort: re-fetch lot_size from instruments or default to 1
+    # (kite_quantity stored in broker order — use quantity from DB × guessed lot_size)
+    # For simplicity & correctness, use pm.execute_sell_and_record which handles this.
+    sell_broker_id, pnl, sell_record = pm.execute_sell_and_record(
+        kite, db, db_order, current_user.id, current_price
+    )
+    if not sell_broker_id:
+        raise HTTPException(
+            status_code=502,
+            detail="Kite SELL order failed. Check Kite app for position status.",
+        )
+
+    db.commit()
+    db.refresh(sell_record)
+
+    logger.info(
+        f"Manual exit on order {order_id}: SELL {db_order.instrument} "
+        f"@ ₹{current_price:.2f}, P&L=₹{pnl:.2f}"
+    )
+    return {
+        "message"             : "Position closed successfully",
+        "order_id"            : order_id,
+        "sell_order_id"       : sell_record.id,
+        "sell_broker_order_id": sell_broker_id,
+        "instrument"          : db_order.instrument,
+        "entry_price"         : db_order.entry_price,
+        "exit_price"          : current_price,
+        "profit_loss"         : round(pnl, 2),
+    }
+
+
 @app.get("/alerts")
 async def get_alerts(
     unactioned_only: bool = True,
@@ -753,6 +1028,15 @@ async def get_suggestions(
     if not current_user.access_token:
         raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
 
+    # Map underlying name → Kite index instrument token
+    _SUGGESTION_TOKENS = {
+        "NIFTY":      256265,   # NSE:NIFTY 50
+        "BANKNIFTY":  260105,   # NSE:NIFTY BANK
+        "NIFTYNXT50": 270857,   # NSE:NIFTY NEXT 50
+        "MIDCPNIFTY": 288009,   # NSE:NIFTY MIDCAP 150
+    }
+    underlying_index_token = _SUGGESTION_TOKENS.get(underlying.upper())
+
     kite = KiteService(current_user.access_token)
     engine = SignalEngine(kite=kite, db=db)
 
@@ -775,6 +1059,7 @@ async def get_suggestions(
                 tradingsymbol=symbol,
                 instrument_token=token,
                 user_id=current_user.id,
+                underlying_token=underlying_index_token,  # always use index for TA
             )
             if result["direction"] == "BUY" and result["confidence"] >= min_confidence:
                 suggestions.append(result)
@@ -797,23 +1082,20 @@ async def get_suggestions(
 @app.get("/rank")
 async def rank_by_win_probability(
     underlying: str = "NIFTY",
-    max_results: int = 10,
+    max_results: int = 20,
     current_user: UserModel = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
     """
     Rank NFO call options for the given underlying by win probability.
 
-    Each instrument is scored across 9 independent factors (total 100 pts):
-      1. RSI oversold + reversal slope      (15 pts)
-      2. MACD crossover + histogram momentum (20 pts)
-      3. Bollinger Band position             (10 pts)
-      4. EMA 9 > EMA 21 trend               (10 pts)
-      5. ATR volatility window               ( 5 pts)
-      6. OI buildup on CE side              (15 pts)
-      7. Volume surge vs average            (10 pts)
-      8. Moneyness (ATM ± 2 strikes)        (10 pts)
-      9. Time-of-day window                 ( 5 pts)
+    Full mode (paid Kite Connect plan with Historical Data add-on):
+      Scores across 13 factors in 5 groups (total 100 pts).
+
+    Degraded mode (free plan / no market data permissions):
+      Returns the instrument list with strike / expiry / lot info.
+      All scoring factors show as N/A — no live prices, no indicators.
+      The list is sorted by strike (nearest to approximate ATM based on expiry).
 
     Supported underlyings: NIFTY, BANKNIFTY, NIFTYNXT50, MIDCPNIFTY
     """
@@ -825,11 +1107,10 @@ async def rank_by_win_probability(
 
     # Map underlying name → Kite index instrument token (used for OHLCV)
     UNDERLYING_TOKENS = {
-        "NIFTY":       256265,    # NSE:NIFTY 50
-        "BANKNIFTY":   260105,    # NSE:NIFTY BANK
-        "NIFTYNXT50":  270857,    # NSE:NIFTY NEXT 50  (NIFTYNXT50)
-        "MIDCPNIFTY":  288009,    # NSE:NIFTY MIDCAP SELECT
-        # Common alternate spellings
+        "NIFTY":       256265,
+        "BANKNIFTY":   260105,
+        "NIFTYNXT50":  270857,
+        "MIDCPNIFTY":  288009,
         "NIFTYMNXT50": 270857,
         "NIFTYMIDCAP": 288009,
     }
@@ -840,83 +1121,218 @@ async def rank_by_win_probability(
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported underlying '{underlying}'. "
-                   f"Use one of: {', '.join(UNDERLYING_TOKENS.keys())}"
+                   f"Use one of: NIFTY, BANKNIFTY, NIFTYNXT50, MIDCPNIFTY"
         )
 
     kite = KiteService(current_user.access_token)
 
-    # ── Single catch for ANY Kite auth/permission failure in this endpoint ────
-    # Wraps the entire block so token expiry from ANY call (validate, ltp,
-    # historical_data, quote, market_depth) returns a clean 403 to the frontend.
-    from kite_service import KiteSessionExpiredError
+    # Check whether market data is available.
+    # KiteSessionExpiredError → propagates to global handler → 403 KITE_TOKEN_EXPIRED
+    # KitePermissionError     → degraded mode (subscription not purchased yet)
     try:
-
-        # Quick upfront check — catches expired tokens before 15+ API calls
         kite.validate_session()
+        market_data_available = True
+    except KitePermissionError:
+        market_data_available = False
+    # KiteSessionExpiredError intentionally NOT caught here — let it bubble up
 
-        instruments = kite.get_option_instruments(underlying)
+    instruments = kite.get_option_instruments(underlying)
 
-        if not instruments:
-            return {
-                "underlying":   underlying,
-                "spot_price":   None,
-                "ranked":       [],
-                "scanned":      0,
-                "scan_time_ms": 0,
-                "message":      f"No CE instruments found for {underlying}",
-            }
-
-        # ── Step 1: narrow to nearest expiry only ────────────────────────────
-        valid_expiries = [i["expiry"] for i in instruments if i.get("expiry")]
-        if valid_expiries:
-            nearest_expiry = min(valid_expiries)
-            instruments = [i for i in instruments if i.get("expiry") == nearest_expiry]
-
-        # ── Step 2: fetch spot price so we can sort by ATM proximity ─────────
-        SPOT_CANDIDATES = {
-            "NIFTY":       ["NSE:NIFTY 50",    "NSE:NIFTY50",   "NSE:NIFTY"],
-            "BANKNIFTY":   ["NSE:NIFTY BANK",  "NSE:BANKNIFTY"],
-            "NIFTYNXT50":  ["NSE:NIFTY NEXT 50"],
-            "MIDCPNIFTY":  ["NSE:NIFTY MIDCAP 150"],
+    if not instruments:
+        return {
+            "underlying":             underlying,
+            "spot_price":             None,
+            "ranked":                 [],
+            "scanned":                0,
+            "scan_time_ms":           0,
+            "market_data_available":  market_data_available,
+            "message":                f"No CE instruments found for {underlying}",
         }
-        spot_candidates = SPOT_CANDIDATES.get(underlying.upper(), [f"NSE:{underlying}"])
-        ltp_map    = kite.get_ltp(spot_candidates)
-        spot_price = next((ltp_map[k] for k in spot_candidates if ltp_map.get(k, 0) > 0), None)
-        logger.info(f"/rank spot_price for {underlying}: {spot_price}")
 
-        # ── Step 3: pick 15 strikes closest to ATM (or by strike order if no spot)
-        if spot_price:
-            instruments = sorted(instruments, key=lambda x: abs(x.get("strike", 0) - spot_price))[:15]
-        else:
-            strikes_sorted = sorted(instruments, key=lambda x: x.get("strike", 0))
-            mid  = len(strikes_sorted) // 2
-            half = 7
-            instruments = strikes_sorted[max(0, mid - half): mid + half + 1][:15]
+    # ── Narrow to nearest expiry ──────────────────────────────────────────────
+    valid_expiries = [i["expiry"] for i in instruments if i.get("expiry")]
+    nearest_expiry = min(valid_expiries) if valid_expiries else None
+    if nearest_expiry:
+        instruments = [i for i in instruments if i.get("expiry") == nearest_expiry]
 
-        logger.info(
-            f"/rank scanning {len(instruments)} instruments for {underlying} "
-            f"(expiry={nearest_expiry if valid_expiries else 'N/A'}, spot={spot_price})"
-        )
+    # ── DEGRADED MODE — no live prices available ──────────────────────────────
+    if not market_data_available:
+        # Sort by strike and pick 20 strikes on each side of ATM (40 total)
+        instruments_sorted = sorted(instruments, key=lambda x: x.get("strike", 0))
+        mid        = len(instruments_sorted) // 2
+        candidates = instruments_sorted[max(0, mid - 20): mid + 20 + 1][:max_results]
 
-        engine = WinProbabilityEngine(kite=kite)
-        result = engine.rank_instruments(
-            underlying=underlying,
-            underlying_token=index_token,
-            instruments=instruments,
-            max_results=max_results,
-            spot_price=spot_price,
-        )
-        result["message"] = (
-            f"Ranked {len(result['ranked'])} instruments (scanned {result['scanned']}) "
-            f"in {result['scan_time_ms']} ms."
-        )
-        return result
+        degraded_ranked = []
+        for i, inst in enumerate(candidates, start=1):
+            degraded_ranked.append({
+                "rank":            i,
+                "instrument":      inst.get("tradingsymbol"),
+                "strike":          inst.get("strike"),
+                "expiry":          str(inst.get("expiry", "")),
+                "lot_size":        inst.get("lot_size", 1),
+                "score":           None,
+                "grade":           "N/A",
+                "last_price":      None,
+                "factors":         {},
+                "veto_notes":      [],
+                "india_vix":       None,
+                "pcr":             None,
+                "pivot_levels":    None,
+                "llm_reasoning":   [],
+                "degraded":        True,   # flag so frontend knows scoring was skipped
+            })
 
-    except KiteSessionExpiredError:
-        raise HTTPException(
-            status_code=403,
-            detail="KITE_TOKEN_EXPIRED: Your Kite session has expired. Please re-link your Kite account from the Dashboard.",
-        )
+        return {
+            "underlying":             underlying,
+            "spot_price":             None,
+            "india_vix":              None,
+            "pcr":                    None,
+            "ranked":                 degraded_ranked,
+            "scanned":                len(candidates),
+            "scan_time_ms":           0,
+            "market_data_available":  False,
+            "message":                (
+                "⚠️ Market data unavailable — showing instrument list only. "
+                "Win probability scores require a paid Kite Connect app (Rs 500/month at developers.kite.trade). "
+                "Historical data is included free. Full scoring resumes automatically once upgraded."
+            ),
+        }
+
+    # ── FULL MODE — market data available ────────────────────────────────────
+    SPOT_CANDIDATES = {
+        "NIFTY":      ["NSE:NIFTY 50",    "NSE:NIFTY50",   "NSE:NIFTY"],
+        "BANKNIFTY":  ["NSE:NIFTY BANK",  "NSE:BANKNIFTY"],
+        "NIFTYNXT50": ["NSE:NIFTY NEXT 50"],
+        "MIDCPNIFTY": ["NSE:NIFTY MIDCAP 150"],
+    }
+    spot_candidates = SPOT_CANDIDATES.get(underlying.upper(), [f"NSE:{underlying}"])
+    ltp_map    = kite.get_ltp(spot_candidates)
+    spot_price = next((ltp_map[k] for k in spot_candidates if ltp_map.get(k, 0) > 0), None)
+    logger.info(f"/rank spot_price for {underlying}: {spot_price}")
+
+    # Pick 20 strikes on each side of ATM (20 OTM + 20 ITM = 40 total).
+    # Using per-side split rather than "closest N" so we always get equal
+    # representation above and below spot — wider scan captures stronger
+    # momentum / order-flow setups further out from ATM.
+    if spot_price:
+        strikes_sorted = sorted(instruments, key=lambda x: x.get("strike", 0))
+        itm = [i for i in strikes_sorted if i.get("strike", 0) <= spot_price]
+        otm = [i for i in strikes_sorted if i.get("strike", 0) >  spot_price]
+        # Last 20 ITM (closest to ATM) + first 20 OTM (closest to ATM)
+        instruments = itm[-20:] + otm[:20]
+    else:
+        strikes_sorted = sorted(instruments, key=lambda x: x.get("strike", 0))
+        mid  = len(strikes_sorted) // 2
+        instruments = strikes_sorted[max(0, mid - 20): mid + 21]
+
+    logger.info(
+        f"/rank scanning {len(instruments)} instruments for {underlying} "
+        f"(expiry={nearest_expiry}, spot={spot_price})"
+    )
+
+    engine = WinProbabilityEngine(kite=kite)
+    result = engine.rank_instruments(
+        underlying=underlying,
+        underlying_token=index_token,
+        instruments=instruments,
+        max_results=max_results,
+        spot_price=spot_price,
+    )
+    result["market_data_available"] = True
+    result["message"] = (
+        f"Ranked {len(result['ranked'])} instruments (scanned {result['scanned']}) "
+        f"in {result['scan_time_ms']} ms."
+    )
+    return result
+
+
+@app.post("/rank/llm-analyze")
+async def llm_analyze_instrument(
+    payload: dict,
+    current_user: UserModel = Depends(get_current_active_user),
+):
+    """
+    Run Claude AI multi-timeframe analysis for a single instrument on-demand.
+    Called when the user clicks the 'Analyse with AI' button on the Win Probability page.
+
+    Payload:
+      tradingsymbol    e.g. "NIFTY25MAR24000CE"
+      instrument_token e.g. 16019202
+      strike           e.g. 24000.0
+      expiry           e.g. "2025-03-27"
+      lot_size         e.g. 25
+      underlying       e.g. "NIFTY"
+      spot_price       e.g. 23850.0  (optional, passed from ranked result)
+      vix              e.g. 14.2     (optional)
+      pcr              e.g. 1.05     (optional)
+
+    Returns the full score_instrument result (same shape as /rank rows) but with
+    llm_reasoning populated and skip_llm=False.
+    Cost: 1 Anthropic API call per click.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked.")
+
+    # Required fields
+    tradingsymbol = payload.get("tradingsymbol")
+    instrument_token = payload.get("instrument_token")
+    if not tradingsymbol:
+        raise HTTPException(status_code=400, detail="tradingsymbol is required")
+    if instrument_token is None:
+        raise HTTPException(status_code=400, detail="instrument_token is required")
+
+    strike    = float(payload.get("strike", 0))
+    expiry    = payload.get("expiry")
+    lot_size  = int(payload.get("lot_size", 1))
+    underlying = payload.get("underlying", "NIFTY").upper()
+    spot_price = payload.get("spot_price")
+    vix        = payload.get("vix")
+    pcr        = payload.get("pcr")
+
+    UNDERLYING_TOKENS = {
+        "NIFTY":       256265,
+        "BANKNIFTY":   260105,
+        "NIFTYNXT50":  270857,
+        "MIDCPNIFTY":  288009,
+        "NIFTYMNXT50": 270857,
+        "NIFTYMIDCAP": 288009,
+    }
+    index_token = UNDERLYING_TOKENS.get(underlying, 256265)
+
+    kite = KiteService(current_user.access_token)
+    try:
+        kite.validate_session()
+    except KitePermissionError:
+        raise HTTPException(status_code=403, detail="KITE_NO_MARKET_DATA: Market data not available on this plan.")
+
+    engine = WinProbabilityEngine(kite=kite)
+
+    # Pre-fetch shared index data (needed for RSI/MACD/EMA context for the LLM)
+    index_df   = engine._fetch_index_ohlcv(index_token)
+    daily_rows = engine._fetch_daily_ohlcv(index_token)
+    if vix is None:
+        vix = engine._fetch_vix()
+    if pcr is None:
+        pcr = engine._fetch_pcr(underlying)
+    if spot_price is None:
+        spot_price = engine._fetch_spot_price(underlying)
+
+    result = engine.score_instrument(
+        tradingsymbol=tradingsymbol,
+        instrument_token=instrument_token,
+        strike=strike,
+        expiry=expiry,
+        lot_size=lot_size,
+        underlying_token=index_token,
+        underlying=underlying,
+        spot_price=spot_price,
+        index_df=index_df,
+        daily_rows=daily_rows,
+        vix=vix,
+        pcr=pcr,
+        skip_llm=False,   # ← THIS IS THE ONLY CALL THAT RUNS THE LLM
+    )
+    return result
 
 
 @app.get("/signals/queue/{instrument}")
@@ -1361,6 +1777,406 @@ async def run_user_trading(user_id: int):
         logger.error(f"Trading error for user {user_id}: {e}")
     finally:
         db.close()
+
+# ── Mock Trading ──────────────────────────────────────────────────────────────
+# Completely separate from real order flow.  No real orders ever placed here.
+# Max 5 OPEN positions per user at any time.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_MOCK_SLOTS = 5
+
+class MockTradeCreate(BaseModel):
+    instrument: str          # e.g. "NIFTY25JUN24500CE"
+    quantity: int = 1
+    notes: Optional[str] = None
+    # entry_price is fetched live from Kite so the user can't fake it
+    # These are passed from the Win Probability page when doing a mock-buy
+    win_probability_score: Optional[float] = None   # 0–100
+    win_probability_grade: Optional[str]   = None   # A+/A/B/C/D
+
+class MockTradeResponse(BaseModel):
+    id: int
+    instrument: str
+    quantity: int
+    entry_price: float
+    notes: Optional[str]
+    win_probability_score: Optional[float]
+    win_probability_grade: Optional[str]
+    entry_time: datetime
+    status: str
+    exit_price: Optional[float]
+    exit_time: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+@app.post("/mock/trades", response_model=MockTradeResponse)
+async def mock_buy(
+    trade: MockTradeCreate,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Open a mock (paper) long position.
+    Entry price is fetched live from Kite LTP — it cannot be manually set.
+    Max 5 open slots enforced.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked. Visit /auth/kite/login first.")
+
+    # Slot check
+    open_count = db.query(MockTradeModel).filter(
+        MockTradeModel.user_id == current_user.id,
+        MockTradeModel.status  == "OPEN",
+    ).count()
+    if open_count >= MAX_MOCK_SLOTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Mock slot limit reached ({MAX_MOCK_SLOTS} open positions). Close one before adding a new one.",
+        )
+
+    # Fetch live LTP for the instrument
+    kite = KiteService(current_user.access_token)
+    symbol = f"NFO:{trade.instrument}"
+    ltp_map = kite.get_ltp([symbol])
+    entry_price = ltp_map.get(symbol)
+    if not entry_price:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not fetch live price for {trade.instrument}. Ensure Kite is linked and market is open.",
+        )
+
+    new_trade = MockTradeModel(
+        user_id               = current_user.id,
+        instrument            = trade.instrument,
+        quantity              = max(1, trade.quantity),
+        entry_price           = entry_price,
+        notes                 = trade.notes,
+        win_probability_score = trade.win_probability_score,
+        win_probability_grade = trade.win_probability_grade,
+        status                = "OPEN",
+    )
+    db.add(new_trade)
+    db.commit()
+    db.refresh(new_trade)
+
+    logger.info(
+        f"Mock trade opened: {trade.instrument} qty={trade.quantity} "
+        f"@ ₹{entry_price} by {current_user.username}"
+    )
+    return new_trade
+
+
+@app.get("/mock/trades", response_model=List[MockTradeResponse])
+async def list_mock_trades(
+    status_filter: Optional[str] = None,   # "OPEN" | "CLOSED" | None (all)
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Return all mock trades for the current user (open and/or closed)."""
+    query = db.query(MockTradeModel).filter(MockTradeModel.user_id == current_user.id)
+    if status_filter:
+        query = query.filter(MockTradeModel.status == status_filter.upper())
+    return query.order_by(MockTradeModel.entry_time.desc()).all()
+
+
+@app.get("/mock/trades/pnl")
+async def mock_pnl_snapshot(
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all OPEN mock trades with live LTP and computed P&L.
+    Designed to be polled by the frontend every N seconds.
+    Also returns slot usage so the UI knows how many slots remain.
+    """
+    if not current_user.access_token:
+        raise HTTPException(status_code=403, detail="Kite account not linked")
+
+    open_trades = db.query(MockTradeModel).filter(
+        MockTradeModel.user_id == current_user.id,
+        MockTradeModel.status  == "OPEN",
+    ).all()
+
+    if not open_trades:
+        return {
+            "positions": [],
+            "total_pnl": 0.0,
+            "open_slots": MAX_MOCK_SLOTS,
+            "used_slots": 0,
+        }
+
+    kite = KiteService(current_user.access_token)
+    symbols = list({f"NFO:{t.instrument}" for t in open_trades})
+    ltp_map = kite.get_ltp(symbols)
+
+    positions = []
+    total_pnl = 0.0
+    for trade in open_trades:
+        sym = f"NFO:{trade.instrument}"
+        ltp = ltp_map.get(sym)
+        pnl = round((ltp - trade.entry_price) * trade.quantity, 2) if ltp else None
+        pnl_pct = (
+            round((ltp - trade.entry_price) / trade.entry_price * 100, 2)
+            if ltp and trade.entry_price
+            else None
+        )
+        if pnl is not None:
+            total_pnl += pnl
+
+        positions.append({
+            "id"          : trade.id,
+            "instrument"  : trade.instrument,
+            "quantity"    : trade.quantity,
+            "entry_price" : trade.entry_price,
+            "entry_time"  : trade.entry_time,
+            "notes"       : trade.notes,
+            "current_ltp" : ltp,
+            "pnl"         : pnl,
+            "pnl_pct"     : pnl_pct,
+        })
+
+    used = len(open_trades)
+    return {
+        "positions"  : positions,
+        "total_pnl"  : round(total_pnl, 2),
+        "used_slots" : used,
+        "open_slots" : MAX_MOCK_SLOTS - used,
+        "fetched_at" : datetime.now().isoformat(),
+    }
+
+
+@app.delete("/mock/trades/{trade_id}")
+async def mock_close(
+    trade_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Close (exit) a mock trade.
+    Fetches live LTP as exit price and marks the trade CLOSED.
+    The record is kept in DB for reference — no permanent deletion.
+    """
+    trade = db.query(MockTradeModel).filter(
+        MockTradeModel.id      == trade_id,
+        MockTradeModel.user_id == current_user.id,
+    ).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Mock trade not found")
+    if trade.status == "CLOSED":
+        raise HTTPException(status_code=400, detail="Trade is already closed")
+
+    exit_price = None
+    if current_user.access_token:
+        kite = KiteService(current_user.access_token)
+        sym = f"NFO:{trade.instrument}"
+        ltp_map = kite.get_ltp([sym])
+        exit_price = ltp_map.get(sym)
+
+    trade.status     = "CLOSED"
+    trade.exit_price = exit_price
+    trade.exit_time  = datetime.now()
+    db.commit()
+    db.refresh(trade)
+
+    pnl = None
+    if exit_price and trade.entry_price:
+        pnl = round((exit_price - trade.entry_price) * trade.quantity, 2)
+
+    logger.info(
+        f"Mock trade closed: {trade.instrument} entry=₹{trade.entry_price} "
+        f"exit=₹{exit_price} pnl=₹{pnl} by {current_user.username}"
+    )
+    return {
+        "message"    : "Mock trade closed",
+        "id"         : trade.id,
+        "instrument" : trade.instrument,
+        "entry_price": trade.entry_price,
+        "exit_price" : exit_price,
+        "pnl"        : pnl,
+    }
+
+
+@app.delete("/mock/trades/{trade_id}/delete")
+async def mock_delete(
+    trade_id: int,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Permanently delete a mock trade record (only allowed for CLOSED trades).
+    Open positions must be closed first.
+    """
+    trade = db.query(MockTradeModel).filter(
+        MockTradeModel.id      == trade_id,
+        MockTradeModel.user_id == current_user.id,
+    ).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Mock trade not found")
+    if trade.status == "OPEN":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete an OPEN mock trade. Close it first.",
+        )
+
+    db.delete(trade)
+    db.commit()
+    logger.info(f"Mock trade {trade_id} deleted by {current_user.username}")
+    return {"message": "Mock trade deleted", "id": trade_id}
+
+
+# ── Mock Trading Performance Analytics ────────────────────────────────────────
+
+@app.get("/mock/trades/analytics")
+async def mock_analytics(
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Compute performance analytics from all CLOSED mock trades.
+
+    Returns:
+      - summary: total trades, win rate, total P&L, avg P&L per trade
+      - by_grade: win rate + avg P&L broken down by win_probability_grade (A+/A/B/C/D)
+      - by_underlying: win rate + total P&L for NIFTY / BANKNIFTY / etc.
+      - by_hour: avg P&L for each entry hour (0–23) — reveals best time of day
+      - score_vs_pnl: list of {score, pnl_pct} points for scatter chart
+      - recent: last 20 closed trades for a trade log table
+    """
+    closed = db.query(MockTradeModel).filter(
+        MockTradeModel.user_id == current_user.id,
+        MockTradeModel.status  == "CLOSED",
+        MockTradeModel.exit_price != None,
+    ).order_by(MockTradeModel.exit_time.desc()).all()
+
+    if not closed:
+        return {
+            "summary":      {"total": 0, "wins": 0, "losses": 0, "win_rate": None,
+                             "total_pnl": 0.0, "avg_pnl": None},
+            "by_grade":     {},
+            "by_underlying": {},
+            "by_hour":      {},
+            "score_vs_pnl": [],
+            "recent":       [],
+        }
+
+    def pnl_for(t):
+        return round((t.exit_price - t.entry_price) * t.quantity, 2)
+
+    def pnl_pct_for(t):
+        if t.entry_price:
+            return round((t.exit_price - t.entry_price) / t.entry_price * 100, 2)
+        return None
+
+    def underlying_from(sym: str) -> str:
+        """Extract index name from trading symbol, e.g. NIFTY25JUN24500CE → NIFTY"""
+        for idx in ["BANKNIFTY", "NIFTYNXT50", "MIDCPNIFTY", "NIFTY"]:
+            if sym.startswith(idx):
+                return idx
+        return sym[:6]   # fallback: first 6 chars
+
+    # ── Compute per-trade pnl ────────────────────────────────────────────────
+    trades_data = []
+    for t in closed:
+        p = pnl_for(t)
+        pp = pnl_pct_for(t)
+        trades_data.append({
+            "id":            t.id,
+            "instrument":    t.instrument,
+            "underlying":    underlying_from(t.instrument),
+            "entry_price":   t.entry_price,
+            "exit_price":    t.exit_price,
+            "quantity":      t.quantity,
+            "pnl":           p,
+            "pnl_pct":       pp,
+            "grade":         t.win_probability_grade,
+            "score":         t.win_probability_score,
+            "entry_time":    t.entry_time.isoformat() if t.entry_time else None,
+            "exit_time":     t.exit_time.isoformat()  if t.exit_time  else None,
+        })
+
+    wins   = [d for d in trades_data if d["pnl"] > 0]
+    losses = [d for d in trades_data if d["pnl"] <= 0]
+    total_pnl = round(sum(d["pnl"] for d in trades_data), 2)
+
+    # ── by_grade ─────────────────────────────────────────────────────────────
+    by_grade: dict = {}
+    for d in trades_data:
+        g = d["grade"] or "Unknown"
+        if g not in by_grade:
+            by_grade[g] = {"trades": 0, "wins": 0, "total_pnl": 0.0, "pnl_list": []}
+        by_grade[g]["trades"]    += 1
+        by_grade[g]["wins"]      += 1 if d["pnl"] > 0 else 0
+        by_grade[g]["total_pnl"] = round(by_grade[g]["total_pnl"] + d["pnl"], 2)
+        by_grade[g]["pnl_list"].append(d["pnl"])
+
+    # Compute win_rate and avg_pnl, remove raw list
+    for g, v in by_grade.items():
+        v["win_rate"] = round(v["wins"] / v["trades"] * 100, 1) if v["trades"] else None
+        v["avg_pnl"]  = round(sum(v["pnl_list"]) / len(v["pnl_list"]), 2)
+        del v["pnl_list"]
+
+    # ── by_underlying ─────────────────────────────────────────────────────────
+    by_underlying: dict = {}
+    for d in trades_data:
+        u = d["underlying"]
+        if u not in by_underlying:
+            by_underlying[u] = {"trades": 0, "wins": 0, "total_pnl": 0.0, "pnl_list": []}
+        by_underlying[u]["trades"]    += 1
+        by_underlying[u]["wins"]      += 1 if d["pnl"] > 0 else 0
+        by_underlying[u]["total_pnl"] = round(by_underlying[u]["total_pnl"] + d["pnl"], 2)
+        by_underlying[u]["pnl_list"].append(d["pnl"])
+
+    for u, v in by_underlying.items():
+        v["win_rate"] = round(v["wins"] / v["trades"] * 100, 1) if v["trades"] else None
+        v["avg_pnl"]  = round(sum(v["pnl_list"]) / len(v["pnl_list"]), 2)
+        del v["pnl_list"]
+
+    # ── by_hour ───────────────────────────────────────────────────────────────
+    by_hour: dict = {}
+    for d in trades_data:
+        if not d["entry_time"]:
+            continue
+        try:
+            hour = datetime.fromisoformat(d["entry_time"]).hour
+        except Exception:
+            continue
+        if hour not in by_hour:
+            by_hour[hour] = {"trades": 0, "wins": 0, "total_pnl": 0.0, "pnl_list": []}
+        by_hour[hour]["trades"]    += 1
+        by_hour[hour]["wins"]      += 1 if d["pnl"] > 0 else 0
+        by_hour[hour]["total_pnl"] = round(by_hour[hour]["total_pnl"] + d["pnl"], 2)
+        by_hour[hour]["pnl_list"].append(d["pnl"])
+
+    for h, v in by_hour.items():
+        v["win_rate"] = round(v["wins"] / v["trades"] * 100, 1) if v["trades"] else None
+        v["avg_pnl"]  = round(sum(v["pnl_list"]) / len(v["pnl_list"]), 2)
+        del v["pnl_list"]
+
+    # ── score_vs_pnl (only trades that came from Win Probability page) ────────
+    score_vs_pnl = [
+        {"score": d["score"], "pnl_pct": d["pnl_pct"]}
+        for d in trades_data
+        if d["score"] is not None and d["pnl_pct"] is not None
+    ]
+
+    return {
+        "summary": {
+            "total":     len(trades_data),
+            "wins":      len(wins),
+            "losses":    len(losses),
+            "win_rate":  round(len(wins) / len(trades_data) * 100, 1),
+            "total_pnl": total_pnl,
+            "avg_pnl":   round(total_pnl / len(trades_data), 2),
+        },
+        "by_grade":      by_grade,
+        "by_underlying": by_underlying,
+        "by_hour":       by_hour,
+        "score_vs_pnl":  score_vs_pnl,
+        "recent":        trades_data[:20],
+    }
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,15 +1,24 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { tradingAPI, kiteAPI, analysisAPI } from '../services/api';
+import { useLocation } from 'react-router-dom';
+import { tradingAPI, kiteAPI, analysisAPI, mockAPI } from '../services/api';
 import { useAuth } from '../services/AuthContext';
 
 const Dashboard = () => {
   const { user } = useAuth();
+  const location = useLocation();
   const [summary, setSummary]         = useState(null);
   const [orders, setOrders]           = useState([]);
   const [instruments, setInstruments] = useState([]);
   const [loading, setLoading]         = useState(true);
   const [syncing, setSyncing]         = useState(false);
   const [syncMsg, setSyncMsg]         = useState('');
+  // Mock trading snapshot for dashboard tile
+  const [mockSnapshot, setMockSnapshot] = useState(null);
+
+  // Detect redirect from a Kite session expiry (any page → /dashboard?kite_expired=1)
+  const kiteExpiredRedirect = new URLSearchParams(location.search).get('kite_expired') === '1';
+  // Detect redirect from a Kite market data permission error (plan/subscription issue)
+  const kiteNoMarketData = new URLSearchParams(location.search).get('kite_no_market_data') === '1';
 
   const fetchAll = useCallback(async () => {
     try {
@@ -25,6 +34,12 @@ const Dashboard = () => {
         try {
           const instRes = await tradingAPI.getInstruments();
           setInstruments(instRes.data.instruments || []);
+        } catch (_) {}
+
+        // Fetch mock P&L snapshot (best-effort — don't block dashboard if it fails)
+        try {
+          const mockRes = await mockAPI.getPnL();
+          setMockSnapshot(mockRes.data);
         } catch (_) {}
       }
     } catch (e) {
@@ -72,6 +87,11 @@ const Dashboard = () => {
   const cash       = summary?.available_cash ?? null;
   const totalPnL   = summary?.total_pnl ?? orders.reduce((s, o) => s + (o.profit_loss || 0), 0);
 
+  // ── Mock snapshot helpers ──────────────────────────────────────
+  const mockPositions = mockSnapshot?.positions?.length ?? 0;
+  const mockTotalPnl  = mockSnapshot?.total_pnl ?? null;
+  const mockUsed      = mockSnapshot?.used_slots ?? 0;
+
   // ── Stat cards ───────────────────────────────────────────────
   const stats = [
     {
@@ -105,6 +125,20 @@ const Dashboard = () => {
       sub     : totalPnL >= 0 ? 'Net profit' : 'Net loss',
       color   : totalPnL >= 0 ? 'bg-green-500' : 'bg-red-500',
       icon    : '₹',
+    },
+    {
+      label   : 'Mock Positions',
+      value   : kiteLinked ? `${mockUsed}/5` : '—',
+      sub     : mockTotalPnl != null
+        ? `P&L: ${mockTotalPnl >= 0 ? '+' : ''}₹${mockTotalPnl.toFixed(2)}`
+        : kiteLinked ? 'No open mocks' : 'Link Kite to see',
+      color   : mockTotalPnl != null && mockTotalPnl >= 0
+        ? 'bg-indigo-500'
+        : mockTotalPnl != null
+        ? 'bg-orange-500'
+        : 'bg-gray-400',
+      icon    : '🧪',
+      href    : '/mock-trading',
     },
   ];
 
@@ -149,6 +183,52 @@ const Dashboard = () => {
         </div>
       )}
 
+      {/* Kite session expired banner — shown when redirected from any page after token expiry */}
+      {kiteExpiredRedirect && (
+        <div className="mb-4 bg-red-50 border-2 border-red-400 rounded-xl p-4 flex items-start gap-4">
+          <span className="text-2xl shrink-0">🔑</span>
+          <div className="flex-1">
+            <p className="font-bold text-red-800 text-sm">Kite Session Expired</p>
+            <p className="text-sm text-red-700 mt-0.5">
+              Your Kite access token has expired (tokens reset daily). Re-link your account below to restore live data.
+            </p>
+          </div>
+          <button
+            onClick={handleConnectKite}
+            className="shrink-0 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-semibold"
+          >
+            🔗 Re-link Now
+          </button>
+        </div>
+      )}
+
+      {/* Kite market data permission banner — subscription/plan issue, re-linking won't help */}
+      {kiteNoMarketData && (
+        <div className="mb-4 bg-orange-50 border-2 border-orange-400 rounded-xl p-4 flex items-start gap-4">
+          <span className="text-2xl shrink-0">⚠️</span>
+          <div className="flex-1">
+            <p className="font-bold text-orange-800 text-sm">Kite Connect Personal Plan — No Market Data Access</p>
+            <p className="text-sm text-orange-700 mt-1">
+              Your API key is on the <strong>free Personal plan</strong> which has no market data access
+              (no quotes, no historical candles). Re-linking will <strong>not</strong> fix this.
+            </p>
+            <p className="text-sm text-orange-700 mt-1">
+              Fix: create a <strong>paid Kite Connect app</strong> at{' '}
+              <a
+                href="https://developers.kite.trade"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline font-semibold"
+              >
+                developers.kite.trade
+              </a>
+              {' '}(₹500/month). Historical data is <strong>included free</strong> — no extra add-on needed.
+              Once you update the API key + secret in your <code className="bg-orange-100 px-1 rounded">.env</code>, everything works automatically.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Kite connection banner */}
       {!kiteLinked ? (
         <div className="mb-6 bg-yellow-50 border border-yellow-300 rounded-lg p-4 flex items-center justify-between">
@@ -178,37 +258,71 @@ const Dashboard = () => {
       )}
 
       {/* Stat Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-        {stats.map(s => (
-          <div key={s.label} className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
-            <div className="flex items-center gap-3 mb-2">
-              <div className={`w-9 h-9 ${s.color} rounded-lg flex items-center justify-center text-white text-sm font-bold shrink-0`}>
-                {s.icon}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-8">
+        {stats.map(s => {
+          const inner = (
+            <>
+              <div className="flex items-center gap-3 mb-2">
+                <div className={`w-9 h-9 ${s.color} rounded-lg flex items-center justify-center text-white text-sm font-bold shrink-0`}>
+                  {s.icon}
+                </div>
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">{s.label}</p>
               </div>
-              <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">{s.label}</p>
+              <p className="text-2xl font-bold text-gray-900">{s.value}</p>
+              <p className="text-xs text-gray-400 mt-0.5">{s.sub}</p>
+            </>
+          );
+          return s.href ? (
+            <a
+              key={s.label}
+              href={s.href}
+              className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer no-underline"
+            >
+              {inner}
+            </a>
+          ) : (
+            <div key={s.label} className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
+              {inner}
             </div>
-            <p className="text-2xl font-bold text-gray-900">{s.value}</p>
-            <p className="text-xs text-gray-400 mt-0.5">{s.sub}</p>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Quick Actions */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5 mb-6">
         <h2 className="text-base font-semibold text-gray-900 mb-3">Quick Actions</h2>
         <div className="flex flex-wrap gap-3">
+
+          {/* Primary morning action — Win Probability scan */}
+          <button
+            onClick={() => window.location.href = '/win-probability'}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-md text-sm font-semibold flex items-center gap-1.5"
+            title="Scan instruments with the 11-factor engine to find the best trade of the day"
+          >
+            🎯 Scan Win Probability
+          </button>
+
+          <button
+            onClick={() => window.location.href = '/mock-trading'}
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium flex items-center gap-1.5"
+          >
+            🧪 Mock Trading
+          </button>
+
           <button
             onClick={() => window.location.href = '/orders'}
             className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium"
           >
-            + Place Order
+            + Place Real Order
           </button>
+
           <button
             onClick={() => window.location.href = '/strategies'}
-            className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-md text-sm font-medium"
+            className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-md text-sm font-medium flex items-center gap-1.5"
           >
-            Strategies
+            📈 Performance
           </button>
+
           {kiteLinked && (
             <button
               onClick={handleSync}
@@ -220,7 +334,8 @@ const Dashboard = () => {
           )}
         </div>
         <p className="text-xs text-gray-400 mt-2">
-          "Restore Orders from Kite" re-imports today's Kite orders into the local database — use this if the database was wiped.
+          Start your day with <strong>Scan Win Probability</strong> → pick Grade A/A+ instruments → open a Mock position to validate → place a real order when confident.
+          "Restore Orders from Kite" re-imports today's Kite orders if the database was wiped.
         </p>
       </div>
 

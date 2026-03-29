@@ -4,9 +4,10 @@ import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import Orders from './pages/Orders';
-import Strategies from './pages/Strategies';
+import Performance from './pages/Strategies';
 import KiteCallback from './pages/KiteCallback';
 import WinProbability from './pages/WinProbability';
+import MockTrading from './pages/MockTrading';
 import Navigation from './components/Navigation';
 import AlertToast from './components/AlertToast';
 import { AuthProvider, useAuth } from './services/AuthContext';
@@ -56,11 +57,15 @@ function AppContent() {
         />
         <Route
           path="/strategies"
-          element={user ? <Strategies /> : <Navigate to="/login" />}
+          element={user ? <Performance /> : <Navigate to="/login" />}
         />
         <Route
           path="/win-probability"
           element={user ? <WinProbability /> : <Navigate to="/login" />}
+        />
+        <Route
+          path="/mock-trading"
+          element={user ? <MockTrading /> : <Navigate to="/login" />}
         />
         <Route
           path="/kite-callback"
